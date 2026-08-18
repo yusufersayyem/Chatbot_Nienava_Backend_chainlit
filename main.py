@@ -1,6 +1,7 @@
 import os
 from dotenv import load_dotenv
 from fastapi import FastAPI
+from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 
@@ -9,28 +10,35 @@ from qdrant_client import QdrantClient
 from langchain_core.prompts import ChatPromptTemplate
 from langchain_core.runnables import RunnablePassthrough
 from langchain_core.output_parsers import StrOutputParser
-from langchain_huggingface import HuggingFaceEndpointEmbeddings
+from langchain_huggingface import HuggingFaceInferenceAPIEmbeddings
 from langchain_mistralai import ChatMistralAI
 
 load_dotenv()
 
 app = FastAPI(title="RAG API - Nineveh & Mosul Uni")
 
-# 1. إعداد المتغيرات البيئية
+# إضافة CORS للفرونت إند
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
 QDRANT_URL = os.getenv("QDRANT_URL")
 QDRANT_API_KEY = os.getenv("QDRANT_API_KEY")
 HF_TOKEN = os.getenv("HF_TOKEN")
+MISTRAL_API_KEY = os.getenv("MISTRAL_API_KEY")
 COLLECTION_NAME = "my_pdf_documents"
 
+# متغير عام لتخزين السلسلة بعد تحميلها لأول مرة فقط
+RAG_CHAIN_CACHE = None
+
 def format_docs(docs):
-    """
-    قراءة الـ metadata الخاصة بكل مستند واستخراج السؤال والجواب بشكل منظم
-    لضمان توفير أفضل سياق وضوحاً للـ LLM
-    """
     formatted_chunks = []
     for doc in docs:
         meta = doc.metadata
-        # استخراج البيانات من الـ metadata مع الاعتماد على page_content كخيار احتياطي
         question = meta.get("question")
         answer = meta.get("answer")
         
@@ -41,11 +49,15 @@ def format_docs(docs):
             
     return "\n\n---\n\n".join(formatted_chunks)
 
-def load_rag_chain():
-    # 2. إعداد نموذج التضمين عبر Hugging Face Endpoint
-    embedding_model = HuggingFaceEndpointEmbeddings(
-        model="BAAI/bge-m3",
-        huggingfacehub_api_token=HF_TOKEN
+def get_rag_chain():
+    global RAG_CHAIN_CACHE
+    if RAG_CHAIN_CACHE is not None:
+        return RAG_CHAIN_CACHE
+
+    # نموذج التضمين المجاني عبر Inference API
+    embedding_model = HuggingFaceInferenceAPIEmbeddings(
+        model_name="BAAI/bge-m3",
+        api_key=HF_TOKEN
     )
     
     client = QdrantClient(url=QDRANT_URL, api_key=QDRANT_API_KEY)
@@ -56,7 +68,6 @@ def load_rag_chain():
         embedding=embedding_model
     )
     
-    # 3. إعداد المسترجع (Retriever)
     retriever = vectorstore.as_retriever(
         search_type="similarity_score_threshold",
         search_kwargs={
@@ -65,15 +76,14 @@ def load_rag_chain():
         }
     )
     
-    # 4. إعداد نموذج اللغة (Mistral AI)
     llm = ChatMistralAI(
         model="mistral-large-latest", 
         temperature=0.0, 
         max_retries=2,
-        streaming=True
+        streaming=True,
+        api_key=MISTRAL_API_KEY
     )
     
-    # 5. تعليمات النظام (System Prompt)
     system_prompt = (
         "أنت مساعد رقمي رسمي للإجابة عن استفسارات مديرية تربية نينوى وجامعة الموصل.\n"
         "التزم بالقواعد التالية بدقة متناهية:\n\n"
@@ -93,7 +103,6 @@ def load_rag_chain():
     
     prompt = ChatPromptTemplate.from_template(system_prompt)
     
-    # 6. بناء السلسلة باستخدام LCEL
     rag_chain = (
         {"context": retriever | format_docs, "question": RunnablePassthrough()}
         | prompt
@@ -101,17 +110,21 @@ def load_rag_chain():
         | StrOutputParser()
     )
     
-    return rag_chain
-
-rag_chain = load_rag_chain()
+    RAG_CHAIN_CACHE = rag_chain
+    return RAG_CHAIN_CACHE
 
 class QueryRequest(BaseModel):
     question: str
 
+@app.get("/")
+def read_root():
+    return {"status": "Backend is running successfully!"}
+
 @app.post("/api/chat/stream")
 async def chat_stream(request: QueryRequest):
+    chain = get_rag_chain()
     async def generate():
-        async for chunk in rag_chain.astream(request.question):
+        async for chunk in chain.astream(request.question):
             yield chunk
 
     return StreamingResponse(generate(), media_type="text/event-stream")
