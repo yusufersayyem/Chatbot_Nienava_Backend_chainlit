@@ -10,15 +10,13 @@ from langchain_qdrant import QdrantVectorStore
 from qdrant_client import QdrantClient
 from langchain_core.prompts import ChatPromptTemplate, MessagesPlaceholder
 from langchain_core.output_parsers import StrOutputParser
-from langchain_huggingface import HuggingFaceEmbeddings
+from langchain_huggingface import HuggingFaceEndpointEmbeddings
 from langchain_groq import ChatGroq
 
-# 1. تحميل البيئة
 load_dotenv()
 
 app = FastAPI(title="Nineveh Education RAG API")
 
-# إتاحة CORS لاتصال الفرونت إند
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -30,11 +28,11 @@ app.add_middleware(
 QDRANT_URL = os.getenv("QDRANT_URL")
 QDRANT_API_KEY = os.getenv("QDRANT_API_KEY")
 GROQ_API_KEY = os.getenv("GROQ_API_KEY")
+HF_TOKEN = os.getenv("HF_TOKEN")  # توكن هاقينج فيس المجاني
 COLLECTION_NAME = "my_pdf_documents"
 
 RAG_RESOURCES = None
 
-# دالة لتنسيق النصوص المسترجعة من Qdrant ليمررها للموديل
 def format_docs(docs):
     formatted_chunks = []
     for doc in docs:
@@ -47,17 +45,15 @@ def format_docs(docs):
             formatted_chunks.append(doc.page_content)
     return "\n\n---\n\n".join(formatted_chunks)
 
-# دالة التهيئة المتأخرة (Lazy Initialization)
 def init_resources():
     global RAG_RESOURCES
     if RAG_RESOURCES is not None:
         return RAG_RESOURCES
 
-    # نفس نموذج التضمين المستخدم بالرفعة لتطابق 100%
-    embedding_model = HuggingFaceEmbeddings(
-        model_name="BAAI/bge-m3",
-        model_kwargs={'device': 'cpu'},
-        encode_kwargs={'normalize_embeddings': True}
+    # استخدام API خارجي مجاني للتضمين يستهلك 0MB من ذاكرة Render!
+    embedding_model = HuggingFaceEndpointEmbeddings(
+        model="BAAI/bge-m3",
+        huggingfacehub_api_token=HF_TOKEN
     )
     
     client = QdrantClient(url=QDRANT_URL, api_key=QDRANT_API_KEY)
@@ -68,13 +64,12 @@ def init_resources():
         embedding=embedding_model
     )
     
-    # مسترجع البيانات
     retriever = vectorstore.as_retriever(
         search_type="similarity",
         search_kwargs={'k': 3}
     )
     
-    # Groq المجاني والسريع
+    # نموذج Llama3 الخفيف والسريع جداً عبر Groq
     llm = ChatGroq(
         model_name="llama-3.1-8b-instant",
         temperature=0.0,
@@ -105,7 +100,6 @@ def init_resources():
     }
     return RAG_RESOURCES
 
-# نماذج طلبات API
 class Message(BaseModel):
     role: str
     content: str
@@ -116,9 +110,8 @@ class QueryRequest(BaseModel):
 
 @app.get("/")
 def read_root():
-    return {"status": "FastAPI Server is running!"}
+    return {"status": "FastAPI Server is online and lightweight!"}
 
-# كاش فحص التحيات والشكر السريعة (توفيراً للحدود المجانية)
 def check_direct_intents(user_input: str) -> Optional[str]:
     text = user_input.strip().lower()
     greetings = ["السلام عليكم", "مرحبا", "مرحباً", "اهلا", "أهلاً", "صباح الخير", "مساء الخير"]
@@ -130,27 +123,22 @@ def check_direct_intents(user_input: str) -> Optional[str]:
         return "العفو، أنا في الخدمة دائماً لأي استفسار رسمي."
     return None
 
-# مسار المحادثة الرئيسي مع Streaming
 @app.post("/api/chat/stream")
 async def chat_stream(request: QueryRequest):
-    # 1. رد مباشر إذا كانت تحية أو شكر
     direct_response = check_direct_intents(request.question)
     if direct_response:
         async def generate_direct():
             yield direct_response
         return StreamingResponse(generate_direct(), media_type="text/event-stream")
 
-    # 2. تشغيل الـ RAG
     resources = init_resources()
     retriever = resources["retriever"]
     prompt = resources["prompt"]
     llm = resources["llm"]
 
-    # جلب المستندات بناءً على السؤال
     docs = await retriever.ainvoke(request.question)
     context_text = format_docs(docs)
 
-    # تجهيز ذاكرة المحادثة السابقة
     formatted_history = [
         (msg.role if msg.role != "user" else "human", msg.content) 
         for msg in request.history
@@ -158,7 +146,6 @@ async def chat_stream(request: QueryRequest):
 
     chain = prompt | llm | StrOutputParser()
     
-    # البث المباشر للإجابة حرفاً بحرف
     async def generate():
         async for chunk in chain.astream({
             "context": context_text,
