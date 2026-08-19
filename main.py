@@ -1,4 +1,5 @@
 import os
+from typing import List, Optional
 from dotenv import load_dotenv
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
@@ -7,18 +8,17 @@ from pydantic import BaseModel
 
 from langchain_qdrant import QdrantVectorStore
 from qdrant_client import QdrantClient
-from langchain_core.prompts import ChatPromptTemplate
-from langchain_core.runnables import RunnablePassthrough
+from langchain_core.prompts import ChatPromptTemplate, MessagesPlaceholder
 from langchain_core.output_parsers import StrOutputParser
-from langchain_huggingface import HuggingFaceEndpointEmbeddings
-from langchain_mistralai import ChatMistralAI
+from langchain_huggingface import HuggingFaceEmbeddings
+from langchain_groq import ChatGroq
 
-# تحميل متغيرات البيئة
+# 1. تحميل البيئة
 load_dotenv()
 
-app = FastAPI(title="RAG API - Nineveh & Mosul Uni")
+app = FastAPI(title="Nineveh Education RAG API")
 
-# إضافة CORS لضمان استقبال الطلبات من الفرونت إند بدون مشاكل
+# إتاحة CORS لاتصال الفرونت إند
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -27,48 +27,39 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# 1. إعداد المتغيرات البيئية
 QDRANT_URL = os.getenv("QDRANT_URL")
 QDRANT_API_KEY = os.getenv("QDRANT_API_KEY")
-HF_TOKEN = os.getenv("HF_TOKEN")
-MISTRAL_API_KEY = os.getenv("MISTRAL_API_KEY")
+GROQ_API_KEY = os.getenv("GROQ_API_KEY")
 COLLECTION_NAME = "my_pdf_documents"
 
-# متغير عام لتخزين السلسلة بعد بنائها أول مرة (Lazy Loading)
-RAG_CHAIN_CACHE = None
+RAG_RESOURCES = None
 
+# دالة لتنسيق النصوص المسترجعة من Qdrant ليمررها للموديل
 def format_docs(docs):
-    """
-    قراءة الـ metadata الخاصة بكل مستند واستخراج السؤال والجواب بشكل منظم
-    """
     formatted_chunks = []
     for doc in docs:
         meta = doc.metadata
-        question = meta.get("question")
-        answer = meta.get("answer")
-        
-        if question and answer:
+        question = meta.get("question", doc.page_content)
+        answer = meta.get("answer", "")
+        if answer:
             formatted_chunks.append(f"السؤال المرجعي: {question}\nالجواب المرجعي: {answer}")
         else:
             formatted_chunks.append(doc.page_content)
-            
     return "\n\n---\n\n".join(formatted_chunks)
 
-def get_rag_chain():
-    """
-    دالة لبناء سلسلة RAG عند الحاجة فقط لتجنب تعطل السيرفر أثناء الإقلاع
-    """
-    global RAG_CHAIN_CACHE
-    if RAG_CHAIN_CACHE is not None:
-        return RAG_CHAIN_CACHE
+# دالة التهيئة المتأخرة (Lazy Initialization)
+def init_resources():
+    global RAG_RESOURCES
+    if RAG_RESOURCES is not None:
+        return RAG_RESOURCES
 
-    # 2. إعداد نموذج التضمين عبر Hugging Face Endpoint بالاسم الصحيح
-    embedding_model = HuggingFaceEndpointEmbeddings(
-        model="BAAI/bge-m3",
-        huggingfacehub_api_token=HF_TOKEN
+    # نفس نموذج التضمين المستخدم بالرفعة لتطابق 100%
+    embedding_model = HuggingFaceEmbeddings(
+        model_name="BAAI/bge-m3",
+        model_kwargs={'device': 'cpu'},
+        encode_kwargs={'normalize_embeddings': True}
     )
     
-    # 3. إعداد الاتصال بقاعدة Qdrant
     client = QdrantClient(url=QDRANT_URL, api_key=QDRANT_API_KEY)
     
     vectorstore = QdrantVectorStore(
@@ -77,69 +68,103 @@ def get_rag_chain():
         embedding=embedding_model
     )
     
-    # 4. إعداد المسترجع (Retriever)
+    # مسترجع البيانات
     retriever = vectorstore.as_retriever(
-        search_type="similarity_score_threshold",
-        search_kwargs={
-            'k': 3,
-            'score_threshold': 0.55
-        }
+        search_type="similarity",
+        search_kwargs={'k': 3}
     )
     
-    # 5. إعداد نموذج اللغة (Mistral AI)
-    llm = ChatMistralAI(
-        model="mistral-large-latest", 
-        temperature=0.0, 
-        max_retries=2,
-        streaming=True,
-        api_key=MISTRAL_API_KEY
+    # Groq المجاني والسريع
+    llm = ChatGroq(
+        model_name="llama-3.1-8b-instant",
+        temperature=0.0,
+        api_key=GROQ_API_KEY,
+        streaming=True
     )
     
-    # 6. تعليمات النظام (System Prompt)
     system_prompt = (
-        "أنت مساعد رقمي رسمي للإجابة عن استفسارات مديرية تربية نينوى وجامعة الموصل.\n"
+        "أنت مساعد رقمي رسمي للإجابة عن استفسارات المديرية العامة لتربية نينوى.\n"
         "التزم بالقواعد التالية بدقة متناهية:\n\n"
-        "1. **التحيات المجرّدة (بدون سؤال):**\n"
-        "   - إذا كانت الرسالة تحية فقط (مثل: 'السلام عليكم' أو 'مرحباً')، أجب بـ: 'وعليكم السلام ورحمة الله وبركاته. أهلاً بك، كيف يمكنني مساعدتك اليوم؟'\n\n"
-        "2. **الأسئلة والاستفسارات (سواء اقترنت بتحية أم لا):**\n"
-        "   - **يُحظر تماماً** البدء بعبارة 'السلام عليكم ورحمة الله وبركاته' عند الإجابة على أي سؤال أو استفسار.\n"
-        "   - ادخل في الإجابة المباشرة عن السؤال فوراً وبأسلوب رسمي اعتماداً على السياق المتاح فقط.\n\n"
-        "3. **الشكر والثناء:**\n"
-        "   - إذا كانت الرسالة عبارة شكر، أجب بـ: 'العفو، هذا واجبي وفي الخدمة دائماً.'\n\n"
-        "4. **قيود السياق:**\n"
-        "   - اعتمد **فقط وحصراً** على أزواج (الأسئلة والأجوبة) المرفقة في السياق.\n"
-        "   - إذا لم تجد إجابة ضمن السياق، أجب بـ: 'عذراً، لا تتوفر معلومة رسمية خاصة بهذا الاستفسار ضمن التعليمات المتاحة حالياً.'\n\n"
-        "السياق المتاح (أسئلة وأجوبة رسمية):\n{context}\n\n"
-        "سؤال/رسالة المستخدم: {question}"
+        "1. ادخل في الإجابة المباشرة عن السؤال فوراً وبأسلوب رسمي اعتماداً على السياق المتاح فقط.\n"
+        "2. اعتمد فقط وحصراً على أزواج (الأسئلة والأجوبة) المرفقة في السياق.\n"
+        "3. إذا لم تجد إجابة صريحة ضمن السياق المرفق، أجب بـ: "
+        "'عذراً، لا تتوفر معلومة رسمية خاصة بهذا الاستفسار ضمن التعليمات المتاحة حالياً.'\n\n"
+        "السياق المتاح:\n{context}"
     )
     
-    prompt = ChatPromptTemplate.from_template(system_prompt)
+    prompt = ChatPromptTemplate.from_messages([
+        ("system", system_prompt),
+        MessagesPlaceholder(variable_name="history"),
+        ("human", "{question}")
+    ])
     
-    # 7. بناء السلسلة باستخدام LCEL
-    rag_chain = (
-        {"context": retriever | format_docs, "question": RunnablePassthrough()}
-        | prompt
-        | llm
-        | StrOutputParser()
-    )
-    
-    RAG_CHAIN_CACHE = rag_chain
-    return RAG_CHAIN_CACHE
+    RAG_RESOURCES = {
+        "retriever": retriever,
+        "prompt": prompt,
+        "llm": llm
+    }
+    return RAG_RESOURCES
+
+# نماذج طلبات API
+class Message(BaseModel):
+    role: str
+    content: str
 
 class QueryRequest(BaseModel):
     question: str
+    history: Optional[List[Message]] = []
 
-# مسار اختبار صحة الخادم (Health Check) لـ Render
 @app.get("/")
 def read_root():
-    return {"status": "Backend is online and running!"}
+    return {"status": "FastAPI Server is running!"}
 
-# مسار البث المباشر للإجابات (Streaming Response)
+# كاش فحص التحيات والشكر السريعة (توفيراً للحدود المجانية)
+def check_direct_intents(user_input: str) -> Optional[str]:
+    text = user_input.strip().lower()
+    greetings = ["السلام عليكم", "مرحبا", "مرحباً", "اهلا", "أهلاً", "صباح الخير", "مساء الخير"]
+    thanks = ["شكرا", "شكراً", "مشكور", "رحم الله والديك", "تسلم"]
+    
+    if text in greetings:
+        return "وعليكم السلام ورحمة الله وبركاته. أهلاً بك، كيف يمكنني مساعدتك في تعليمات تربية نينوى اليوم؟"
+    if text in thanks:
+        return "العفو، أنا في الخدمة دائماً لأي استفسار رسمي."
+    return None
+
+# مسار المحادثة الرئيسي مع Streaming
 @app.post("/api/chat/stream")
 async def chat_stream(request: QueryRequest):
-    chain = get_rag_chain()
+    # 1. رد مباشر إذا كانت تحية أو شكر
+    direct_response = check_direct_intents(request.question)
+    if direct_response:
+        async def generate_direct():
+            yield direct_response
+        return StreamingResponse(generate_direct(), media_type="text/event-stream")
+
+    # 2. تشغيل الـ RAG
+    resources = init_resources()
+    retriever = resources["retriever"]
+    prompt = resources["prompt"]
+    llm = resources["llm"]
+
+    # جلب المستندات بناءً على السؤال
+    docs = await retriever.ainvoke(request.question)
+    context_text = format_docs(docs)
+
+    # تجهيز ذاكرة المحادثة السابقة
+    formatted_history = [
+        (msg.role if msg.role != "user" else "human", msg.content) 
+        for msg in request.history
+    ]
+
+    chain = prompt | llm | StrOutputParser()
+    
+    # البث المباشر للإجابة حرفاً بحرف
     async def generate():
-        async for chunk in chain.astream(request.question):
+        async for chunk in chain.astream({
+            "context": context_text,
+            "question": request.question,
+            "history": formatted_history
+        }):
             yield chunk
 
     return StreamingResponse(generate(), media_type="text/event-stream")
