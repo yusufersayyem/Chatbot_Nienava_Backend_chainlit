@@ -2,10 +2,9 @@ fastapi
 uvicorn
 python-dotenv
 pydantic
-langchain-core
-langchain-community
-langchain-huggingface
 langchain-qdrant
-langchain-mistralai
 qdrant-client
-huggingface_hub
+langchain-core
+langchain-huggingface
+langchain-groq
+sentence-transformers
