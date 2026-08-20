@@ -13,10 +13,12 @@ from langchain_core.output_parsers import StrOutputParser
 from langchain_huggingface import HuggingFaceEmbeddings
 from langchain_mistralai import ChatMistralAI
 
+# 1. تحميل متغيرات البيئة
 load_dotenv()
 
 app = FastAPI(title="Nineveh Education RAG API")
 
+# إتاحة CORS للاتصال مع الفرونت إند
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -32,6 +34,7 @@ COLLECTION_NAME = "my_pdf_documents"
 
 RAG_RESOURCES = None
 
+# دالة لتنسيق النصوص المسترجعة من Qdrant
 def format_docs(docs):
     formatted_chunks = []
     for doc in docs:
@@ -44,18 +47,20 @@ def format_docs(docs):
             formatted_chunks.append(doc.page_content)
     return "\n\n---\n\n".join(formatted_chunks)
 
+# دالة تهيئة الموارد (تُستدعى عند الإقلاع)
 def init_resources():
     global RAG_RESOURCES
     if RAG_RESOURCES is not None:
         return RAG_RESOURCES
 
-    # نموذج التضمين الموحد والأساسي
+    print("جاري تحميل نموذج BAAI/bge-m3...")
     embedding_model = HuggingFaceEmbeddings(
         model_name="BAAI/bge-m3",
         model_kwargs={'device': 'cpu'},
         encode_kwargs={'normalize_embeddings': True}
     )
     
+    print("جاري الاتصال بـ Qdrant Cloud...")
     client = QdrantClient(url=QDRANT_URL, api_key=QDRANT_API_KEY)
     
     vectorstore = QdrantVectorStore(
@@ -69,7 +74,7 @@ def init_resources():
         search_kwargs={'k': 3}
     )
     
-    # استخدام Mistral الموثوق والمستقر جداً في توليد الاستجابات الحية
+    print("جاري تهيئة نموذج Mistral AI...")
     llm = ChatMistralAI(
         model="mistral-large-latest",
         temperature=0.0,
@@ -100,6 +105,14 @@ def init_resources():
     }
     return RAG_RESOURCES
 
+# الحدث الأهم: التسخين المسبق وتحميل النموذج فور تشغيل السيرفر على Render
+@app.on_event("startup")
+async def startup_event():
+    print("⚡ جاري بدء عملية التسخين المسبق (Warm-up)...")
+    init_resources()
+    print("✅ تم تحميل النموذج وقاعدة البيانات بنجاح، السيرفر جاهز لخدمة المستخدمين!")
+
+# نماذج طلبات API
 class Message(BaseModel):
     role: str
     content: str
@@ -110,8 +123,9 @@ class QueryRequest(BaseModel):
 
 @app.get("/")
 def read_root():
-    return {"status": "FastAPI Server is running successfully!"}
+    return {"status": "FastAPI Server is online and pre-warmed!"}
 
+# فحص التحيات والشكر المباشر
 def check_direct_intents(user_input: str) -> Optional[str]:
     text = user_input.strip().lower()
     greetings = ["السلام عليكم", "مرحبا", "مرحباً", "اهلا", "أهلاً", "صباح الخير", "مساء الخير"]
@@ -123,6 +137,7 @@ def check_direct_intents(user_input: str) -> Optional[str]:
         return "العفو، أنا في الخدمة دائماً لأي استفسار رسمي."
     return None
 
+# المسار الرئيسي للمحادثة مع البث الحي
 @app.post("/api/chat/stream")
 async def chat_stream(request: QueryRequest):
     direct_response = check_direct_intents(request.question)
@@ -158,5 +173,5 @@ async def chat_stream(request: QueryRequest):
         return StreamingResponse(generate(), media_type="text/event-stream")
     except Exception as e:
         async def generate_error():
-            yield f"حدث خطأ أثناء معالجة الطلب: {str(e)}"
+            yield f"⚠️ حدث خطأ في معالجة الطلب داخل الباك إند: {str(e)}"
         return StreamingResponse(generate_error(), media_type="text/event-stream")
