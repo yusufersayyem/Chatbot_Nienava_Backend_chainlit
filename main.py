@@ -1,4 +1,6 @@
 import os
+import asyncio
+from concurrent.futures import ThreadPoolExecutor
 from typing import List, Optional
 from dotenv import load_dotenv
 from fastapi import FastAPI
@@ -11,7 +13,7 @@ from qdrant_client import QdrantClient
 from langchain_core.prompts import ChatPromptTemplate, MessagesPlaceholder
 from langchain_core.output_parsers import StrOutputParser
 from langchain_huggingface import HuggingFaceEmbeddings
-from langchain_mistralai import ChatMistralAI
+from langchain_groq import ChatGroq
 
 load_dotenv()
 
@@ -27,10 +29,11 @@ app.add_middleware(
 
 QDRANT_URL = os.getenv("QDRANT_URL")
 QDRANT_API_KEY = os.getenv("QDRANT_API_KEY")
-MISTRAL_API_KEY = os.getenv("MISTRAL_API_KEY")
+GROQ_API_KEY = os.getenv("GROQ_API_KEY")
 COLLECTION_NAME = "my_pdf_documents"
 
 RAG_RESOURCES = None
+executor = ThreadPoolExecutor(max_workers=1)
 
 def format_docs(docs):
     formatted_chunks = []
@@ -44,7 +47,7 @@ def format_docs(docs):
             formatted_chunks.append(doc.page_content)
     return "\n\n---\n\n".join(formatted_chunks)
 
-def init_resources():
+def _load_resources_sync():
     global RAG_RESOURCES
     if RAG_RESOURCES is not None:
         return RAG_RESOURCES
@@ -68,10 +71,10 @@ def init_resources():
         search_kwargs={'k': 3}
     )
     
-    llm = ChatMistralAI(
-        model="mistral-large-latest",
+    llm = ChatGroq(
+        model_name="llama-3.3-70b-versatile",
         temperature=0.0,
-        api_key=MISTRAL_API_KEY,
+        api_key=GROQ_API_KEY,
         streaming=True
     )
     
@@ -98,6 +101,10 @@ def init_resources():
     }
     return RAG_RESOURCES
 
+async def get_resources():
+    loop = asyncio.get_running_loop()
+    return await loop.run_in_executor(executor, _load_resources_sync)
+
 class Message(BaseModel):
     role: str
     content: str
@@ -108,7 +115,7 @@ class QueryRequest(BaseModel):
 
 @app.get("/")
 def read_root():
-    return {"status": "FastAPI Server is online!"}
+    return {"status": "FastAPI Server with Llama-3.3-70b is online!"}
 
 def check_direct_intents(user_input: str) -> Optional[str]:
     text = user_input.strip().lower()
@@ -130,7 +137,7 @@ async def chat_stream(request: QueryRequest):
         return StreamingResponse(generate_direct(), media_type="text/event-stream")
 
     try:
-        resources = init_resources()
+        resources = await get_resources()
         retriever = resources["retriever"]
         prompt = resources["prompt"]
         llm = resources["llm"]
