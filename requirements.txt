@@ -6,5 +6,5 @@ langchain-qdrant
 qdrant-client
 langchain-core
 langchain-huggingface
-langchain-mistralai
+langchain-groq
 sentence-transformers
