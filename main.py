@@ -1,24 +1,16 @@
 import os
-import asyncio
-from concurrent.futures import ThreadPoolExecutor
-from typing import List, Optional
-from dotenv import load_dotenv
-from fastapi import FastAPI
+from typing import List, AsyncGenerator
+from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
+from sse_starlette.sse import EventSourceResponse
+from huggingface_hub import AsyncInferenceClient, InferenceClient
+from langchain_core.embeddings import Embeddings
+from langchain_community.vectorstores import FAISS
 
-from langchain_qdrant import QdrantVectorStore
-from qdrant_client import QdrantClient
-from langchain_core.prompts import ChatPromptTemplate, MessagesPlaceholder
-from langchain_core.output_parsers import StrOutputParser
-from langchain_huggingface import HuggingFaceEmbeddings
-from langchain_groq import ChatGroq
+app = FastAPI(title="RAG Chat Backend")
 
-load_dotenv()
-
-app = FastAPI(title="Nineveh Education RAG API")
-
+# السماح للـ Frontend بالاتصال (CORS)
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -27,141 +19,85 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-QDRANT_URL = os.getenv("QDRANT_URL")
-QDRANT_API_KEY = os.getenv("QDRANT_API_KEY")
-GROQ_API_KEY = os.getenv("GROQ_API_KEY")
-COLLECTION_NAME = "my_pdf_documents"
+HF_TOKEN = os.environ.get("HF_TOKEN")
+MODEL_ID = "Qwen/Qwen2.5-72B-Instruct"
+EMBEDDING_MODEL_ID = "BAAI/bge-m3"
+FAISS_INDEX_PATH = "faiss_index"
 
-RAG_RESOURCES = None
-executor = ThreadPoolExecutor(max_workers=1)
+class DirectHFEmbeddings(Embeddings):
+    def __init__(self, model_name: str, token: str):
+        self.client = InferenceClient(model=model_name, token=token)
 
-def format_docs(docs):
-    formatted_chunks = []
-    for doc in docs:
-        meta = doc.metadata
-        question = meta.get("question", doc.page_content)
-        answer = meta.get("answer", "")
-        if answer:
-            formatted_chunks.append(f"السؤال المرجعي: {question}\nالجواب المرجعي: {answer}")
-        else:
-            formatted_chunks.append(doc.page_content)
-    return "\n\n---\n\n".join(formatted_chunks)
+    def embed_documents(self, texts: List[str]) -> List[List[float]]:
+        response = self.client.feature_extraction(texts)
+        return response.tolist() if hasattr(response, "tolist") else response
 
-def _load_resources_sync():
-    global RAG_RESOURCES
-    if RAG_RESOURCES is not None:
-        return RAG_RESOURCES
+    def embed_query(self, text: str) -> List[float]:
+        response = self.client.feature_extraction(text)
+        if isinstance(response, list) and len(response) > 0 and isinstance(response[0], list):
+            if isinstance(response[0][0], list):
+                response = response[0][0]
+            else:
+                response = response[0]
+        return response.tolist() if hasattr(response, "tolist") else response
 
-    embedding_model = HuggingFaceEmbeddings(
-        model_name="BAAI/bge-m3",
-        model_kwargs={'device': 'cpu'},
-        encode_kwargs={'normalize_embeddings': True}
-    )
-    
-    client = QdrantClient(url=QDRANT_URL, api_key=QDRANT_API_KEY)
-    
-    vectorstore = QdrantVectorStore(
-        client=client,
-        collection_name=COLLECTION_NAME,
-        embedding=embedding_model
-    )
-    
-    retriever = vectorstore.as_retriever(
-        search_type="similarity",
-        search_kwargs={'k': 3}
-    )
-    
-    llm = ChatGroq(
-        model_name="llama-3.3-70b-versatile",
-        temperature=0.0,
-        api_key=GROQ_API_KEY,
-        streaming=True
-    )
-    
-    system_prompt = (
-        "أنت مساعد رقمي رسمي للإجابة عن استفسارات المديرية العامة لتربية نينوى.\n"
-        "التزم بالقواعد التالية بدقة متناهية:\n\n"
-        "1. ادخل في الإجابة المباشرة عن السؤال فوراً وبأسلوب رسمي اعتماداً على السياق المتاح فقط.\n"
-        "2. اعتمد فقط وحصراً على أزواج (الأسئلة والأجوبة) المرفقة في السياق.\n"
-        "3. إذا لم تجد إجابة صريحة ضمن السياق المرفق، أجب بـ: "
-        "'عذراً، لا تتوفر معلومة رسمية خاصة بهذا الاستفسار ضمن التعليمات المتاحة حالياً.'\n\n"
-        "السياق المتاح:\n{context}"
-    )
-    
-    prompt = ChatPromptTemplate.from_messages([
-        ("system", system_prompt),
-        MessagesPlaceholder(variable_name="history"),
-        ("human", "{question}")
-    ])
-    
-    RAG_RESOURCES = {
-        "retriever": retriever,
-        "prompt": prompt,
-        "llm": llm
-    }
-    return RAG_RESOURCES
+llm_client = AsyncInferenceClient(model=MODEL_ID, token=HF_TOKEN)
+embeddings = DirectHFEmbeddings(model_name=EMBEDDING_MODEL_ID, token=HF_TOKEN)
 
-async def get_resources():
-    loop = asyncio.get_running_loop()
-    return await loop.run_in_executor(executor, _load_resources_sync)
+vector_store = FAISS.load_local(
+    FAISS_INDEX_PATH, 
+    embeddings, 
+    allow_dangerous_deserialization=True
+)
 
-class Message(BaseModel):
+class ChatMessage(BaseModel):
     role: str
     content: str
 
-class QueryRequest(BaseModel):
-    question: str
-    history: Optional[List[Message]] = []
+class ChatRequest(BaseModel):
+    message: str
+    history: List[ChatMessage] = []
 
-@app.get("/")
-def read_root():
-    return {"status": "FastAPI Server with Llama-3.3-70b is online!"}
-
-def check_direct_intents(user_input: str) -> Optional[str]:
-    text = user_input.strip().lower()
-    greetings = ["السلام عليكم", "مرحبا", "مرحباً", "اهلا", "أهلاً", "صباح الخير", "مساء الخير"]
-    thanks = ["شكرا", "شكراً", "مشكور", "رحم الله والديك", "تسلم"]
-    
-    if text in greetings:
-        return "وعليكم السلام ورحمة الله وبركاته. أهلاً بك، كيف يمكنني مساعدتك في تعليمات تربية نينوى اليوم؟"
-    if text in thanks:
-        return "العفو، أنا في الخدمة دائماً لأي استفسار رسمي."
-    return None
-
-@app.post("/api/chat/stream")
-async def chat_stream(request: QueryRequest):
-    direct_response = check_direct_intents(request.question)
-    if direct_response:
-        async def generate_direct():
-            yield direct_response
-        return StreamingResponse(generate_direct(), media_type="text/event-stream")
-
+async def generate_chat_stream(message: str, history: List[ChatMessage]) -> AsyncGenerator[str, None]:
     try:
-        resources = await get_resources()
-        retriever = resources["retriever"]
-        prompt = resources["prompt"]
-        llm = resources["llm"]
+        docs = vector_store.similarity_search(message, k=2)
+        context_text = "\n\n".join([doc.page_content for doc in docs]) if docs else ""
 
-        docs = await retriever.ainvoke(request.question)
-        context_text = format_docs(docs)
+        if context_text:
+            user_prompt = f"المعلومات المستخرجة من قاعدة البيانات:\n{context_text}\n\nسؤال المستخدم: {message}"
+        else:
+            user_prompt = message
 
-        formatted_history = [
-            (msg.role if msg.role != "user" else "human", msg.content) 
-            for msg in request.history
+        messages_for_llm = [
+            {"role": "system", "content": "أنت مساعد ذكي ومفيد. اعتمِد على السياق المرفق للإجابة عن أسئلة المستخدم بوضوح ودقة."}
         ]
-
-        chain = prompt | llm | StrOutputParser()
         
-        async def generate():
-            async for chunk in chain.astream({
-                "context": context_text,
-                "question": request.question,
-                "history": formatted_history
-            }):
-                yield chunk
+        for msg in history:
+            messages_for_llm.append({"role": msg.role, "content": msg.content})
+            
+        messages_for_llm.append({"role": "user", "content": user_prompt})
 
-        return StreamingResponse(generate(), media_type="text/event-stream")
+        stream = await llm_client.chat_completion(
+            messages=messages_for_llm,
+            max_tokens=2048,
+            temperature=0.3,
+            stream=True
+        )
+
+        async for chunk in stream:
+            if chunk.choices and chunk.choices[0].delta.content:
+                yield chunk.choices[0].delta.content
+
     except Exception as e:
-        async def generate_error():
-            yield f"⚠️ حدث خطأ في معالجة الطلب داخل الباك إند: {str(e)}"
-        return StreamingResponse(generate_error(), media_type="text/event-stream")
+        yield f"\n[حدث خطأ: {str(e)}]"
+
+@app.post("/api/chat")
+async def chat_endpoint(request: ChatRequest):
+    return EventSourceResponse(
+        generate_chat_stream(request.message, request.history),
+        media_type="text/event-stream"
+    )
+
+if __name__ == "__main__":
+    import uvicorn
+    uvicorn.run("main:app", host="0.0.0.0", port=8000, reload=True)
