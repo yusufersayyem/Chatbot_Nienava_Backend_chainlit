@@ -1,6 +1,6 @@
 import os
 from typing import List, AsyncGenerator
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from sse_starlette.sse import EventSourceResponse
@@ -10,7 +10,7 @@ from langchain_community.vectorstores import FAISS
 
 app = FastAPI(title="RAG Chat Backend")
 
-# السماح للـ Frontend بالاتصال (CORS)
+# السماح للـ Frontend بالاتصال من أي مصدر (CORS)
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -69,7 +69,10 @@ async def generate_chat_stream(message: str, history: List[ChatMessage]) -> Asyn
             user_prompt = message
 
         messages_for_llm = [
-            {"role": "system", "content": "أنت مساعد ذكي ومفيد. اعتمِد على السياق المرفق للإجابة عن أسئلة المستخدم بوضوح ودقة."}
+            {
+                "role": "system", 
+                "content": "أنت مساعد ذكي ومفيد. اعتمِد على السياق المرفق للإجابة عن أسئلة المستخدم بوضوح ودقة. إذا لم تجد الإجابة في السياق، أجب بما تعرفه بشكل عام."
+            }
         ]
         
         for msg in history:
@@ -89,7 +92,7 @@ async def generate_chat_stream(message: str, history: List[ChatMessage]) -> Asyn
                 yield chunk.choices[0].delta.content
 
     except Exception as e:
-        yield f"\n[حدث خطأ: {str(e)}]"
+        yield f"\n[حدث خطأ أثناء معالجة الطلب: {str(e)}]"
 
 @app.post("/api/chat")
 async def chat_endpoint(request: ChatRequest):
@@ -98,6 +101,11 @@ async def chat_endpoint(request: ChatRequest):
         media_type="text/event-stream"
     )
 
+@app.get("/")
+async def root():
+    return {"status": "ok", "message": "Backend is running successfully!"}
+
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run("main:app", host="0.0.0.0", port=8000, reload=True)
+    port = int(os.environ.get("PORT", 8000))
+    uvicorn.run("main:app", host="0.0.0.0", port=port)
