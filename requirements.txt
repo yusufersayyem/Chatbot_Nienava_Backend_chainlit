@@ -1,10 +1,7 @@
 fastapi
 uvicorn
-python-dotenv
+sse-starlette
 pydantic
-langchain-qdrant
-qdrant-client
-langchain-core
-langchain-huggingface
-langchain-groq
-sentence-transformers
+langchain-community
+faiss-cpu
+huggingface-hub
