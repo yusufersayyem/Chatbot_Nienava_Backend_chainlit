@@ -8,9 +8,9 @@ from huggingface_hub import AsyncInferenceClient, InferenceClient
 from langchain_core.embeddings import Embeddings
 from langchain_community.vectorstores import FAISS
 
+# 1. تهيئة تطبيق FastAPI وإعدادات CORS للاتصال بالفرونت إند
 app = FastAPI(title="RAG Chat Backend")
 
-# السماح للـ Frontend بالاتصال من أي مكان
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -19,11 +19,13 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+# 2. المفاتيح والمعايير الأساسية
 HF_TOKEN = os.environ.get("HF_TOKEN")
 MODEL_ID = "Qwen/Qwen2.5-72B-Instruct"
 EMBEDDING_MODEL_ID = "BAAI/bge-m3"
 FAISS_INDEX_PATH = "faiss_index"
 
+# 3. فئة تخصيص الـ Embeddings من HuggingFace
 class DirectHFEmbeddings(Embeddings):
     def __init__(self, model_name: str, token: str):
         self.client = InferenceClient(model=model_name, token=token)
@@ -41,6 +43,7 @@ class DirectHFEmbeddings(Embeddings):
                 response = response[0]
         return response.tolist() if hasattr(response, "tolist") else response
 
+# 4. تهيئة العملاء وقاعدة البيانات FAISS
 llm_client = AsyncInferenceClient(model=MODEL_ID, token=HF_TOKEN)
 embeddings = DirectHFEmbeddings(model_name=EMBEDDING_MODEL_ID, token=HF_TOKEN)
 
@@ -50,6 +53,7 @@ vector_store = FAISS.load_local(
     allow_dangerous_deserialization=True
 )
 
+# 5. بناء هيكل البيانات المتبادلة (Schemas)
 class ChatMessage(BaseModel):
     role: str
     content: str
@@ -58,12 +62,16 @@ class ChatRequest(BaseModel):
     message: str
     history: List[ChatMessage] = []
 
+# 6. دالة معالجة البحث والبث التدفقي (تم إصلاح خطأ الدمج النصي هنا)
 async def generate_chat_stream(message: str, history: List[ChatMessage]) -> AsyncGenerator[str, None]:
     try:
+        # البحث الدلالي في قاعدة البيانات FAISS
         docs = vector_store.similarity_search(message, k=2)
-        # تحويل المحتوى إلى str لتفادي خطأ الدمج
+        
+        # تحويل محتوى كل مستند إلى str صراحة لمنع خطأ جمع النص مع أرقام int
         context_text = "\n\n".join([str(doc.page_content) for doc in docs]) if docs else ""
 
+        # إعداد نص الإدخال الموجه للنموذج
         if context_text:
             user_prompt = f"المعلومات المستخرجة من قاعدة البيانات:\n{context_text}\n\nسؤال المستخدم: {message}"
         else:
@@ -72,15 +80,17 @@ async def generate_chat_stream(message: str, history: List[ChatMessage]) -> Asyn
         messages_for_llm = [
             {
                 "role": "system", 
-                "content": "أنت مساعد ذكي ومفيد. اعتمِد على السياق المرفق للإجابة عن أسئلة المستخدم بوضوح ودقة."
+                "content": "أنت مساعد ذكي ومفيد. اعتمِد على السياق المرفق للإجابة عن أسئلة المستخدم بوضوح ودقة. إذا لم تجد الإجابة في السياق، أجب بما تعرفه بشكل عام."
             }
         ]
         
+        # إضافة سجل المحادثة السابق
         for msg in history:
             messages_for_llm.append({"role": msg.role, "content": msg.content})
             
         messages_for_llm.append({"role": "user", "content": user_prompt})
 
+        # إرسال الطلب واستقبال البث التدفقي من نموذج Qwen
         stream = await llm_client.chat_completion(
             messages=messages_for_llm,
             max_tokens=2048,
@@ -95,6 +105,7 @@ async def generate_chat_stream(message: str, history: List[ChatMessage]) -> Asyn
     except Exception as e:
         yield f"\n[حدث خطأ أثناء معالجة الطلب: {str(e)}]"
 
+# 7. المسارات الرئيسية للـ API
 @app.post("/api/chat")
 async def chat_endpoint(request: ChatRequest):
     return EventSourceResponse(
@@ -104,8 +115,9 @@ async def chat_endpoint(request: ChatRequest):
 
 @app.get("/")
 async def root():
-    return {"status": "ok", "message": "Backend is running!"}
+    return {"status": "ok", "message": "Backend is running successfully!"}
 
+# 8. نقطة البدء التشغيلية
 if __name__ == "__main__":
     import uvicorn
     port = int(os.environ.get("PORT", 8000))
