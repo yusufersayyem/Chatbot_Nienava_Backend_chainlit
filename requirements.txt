@@ -1,7 +1,6 @@
 fastapi
 uvicorn
-sse-starlette
-pydantic
+huggingface_hub
+langchain-core
 langchain-community
 faiss-cpu
-huggingface-hub
