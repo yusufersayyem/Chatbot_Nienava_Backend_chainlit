@@ -1,17 +1,17 @@
 import os
-import asyncio
 from typing import List
-import chainlit as cl
+from fastapi import FastAPI, HTTPException
+from pydantic import BaseModel
 from huggingface_hub import InferenceClient
 from langchain_core.embeddings import Embeddings
 from langchain_community.vectorstores import FAISS
 
-# 1. إعداد المتغيرات والمفاتيح
+app = FastAPI(title="RAG Search Backend")
+
 HF_TOKEN = os.environ.get("HF_TOKEN")
 EMBEDDING_MODEL_ID = "BAAI/bge-m3"
 FAISS_INDEX_PATH = "faiss_index"
 
-# 2. كلاس الـ Embeddings
 class DirectHFEmbeddings(Embeddings):
     def __init__(self, model_name: str, token: str):
         self.client = InferenceClient(model=model_name, token=token)
@@ -38,32 +38,23 @@ class DirectHFEmbeddings(Embeddings):
         response = self.client.feature_extraction(text)
         return self._process_response(response)
 
-# 3. تهيئة النموذج وقاعدة البيانات
+# تحميل النموذج وقاعدة البيانات عند تشغيل السيرفر
 embeddings = DirectHFEmbeddings(model_name=EMBEDDING_MODEL_ID, token=HF_TOKEN)
-
 vector_store = FAISS.load_local(
     FAISS_INDEX_PATH, 
     embeddings, 
     allow_dangerous_deserialization=True
 )
 
-@cl.on_message
-async def main(message: cl.Message):
+class QueryRequest(BaseModel):
+    query: str
+
+@app.post("/search")
+async def search(req: QueryRequest):
     try:
-        # البحث عن أحدث وأقرب إجابة لسؤال المستخدم (k=1 للوصول لأدق إجابة مباشرة)
-        # يمكنك زيادة k إلى 2 أو 3 إذا أردت عرض أكثر من خيار للمستخدم
-        docs = await asyncio.to_thread(
-            vector_store.similarity_search, message.content, k=1
-        )
-
+        docs = vector_store.similarity_search(req.query, k=1)
         if docs:
-            # عرض الإجابة المستخرجة مباشرة
-            answer = docs[0].page_content
-            await cl.Message(content=answer).send()
-        else:
-            await cl.Message(
-                content="عذراً، هذه المعلومة غير متوفرة في قاعدة البيانات المتاحة لدي."
-            ).send()
-
+            return {"answer": docs[0].page_content}
+        return {"answer": None}
     except Exception as e:
-        await cl.Message(content=f"حدث خطأ أثناء الاتصال بالنظام: {str(e)}").send()
+        raise HTTPException(status_code=500, detail=str(e))
