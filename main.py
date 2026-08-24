@@ -1,5 +1,6 @@
 import os
 import re
+import json
 import asyncio
 from typing import List
 from fastapi import FastAPI, HTTPException
@@ -8,15 +9,27 @@ from sse_starlette.sse import EventSourceResponse
 from huggingface_hub import InferenceClient
 from langchain_core.embeddings import Embeddings
 from langchain_community.vectorstores import FAISS
+from openai import AsyncOpenAI
 
-app = FastAPI(title="RAG Streaming Backend")
+app = FastAPI(title="RAG Streaming Backend - Nineveh Edu")
 
+# ==========================================
 # 1. إعداد المتغيرات والمفاتيح
+# ==========================================
 HF_TOKEN = os.environ.get("HF_TOKEN")
+OPENROUTER_API_KEY = os.environ.get("OPENROUTER_API_KEY")
 EMBEDDING_MODEL_ID = "BAAI/bge-m3"
 FAISS_INDEX_PATH = "faiss_index"
 
+# تهيئة عميل OpenRouter (AsyncOpenAI)
+llm_client = AsyncOpenAI(
+    base_url="https://openrouter.ai/api/v1",
+    api_key=OPENROUTER_API_KEY,
+)
+
+# ==========================================
 # 2. كلاس الـ Embeddings الخاص بـ HuggingFace
+# ==========================================
 class DirectHFEmbeddings(Embeddings):
     def __init__(self, model_name: str, token: str):
         self.client = InferenceClient(model=model_name, token=token)
@@ -43,7 +56,9 @@ class DirectHFEmbeddings(Embeddings):
         response = self.client.feature_extraction(text)
         return self._process_response(response)
 
-# 3. تهيئة النموذج وقاعدة البيانات عند بدء التشغيل
+# ==========================================
+# 3. تهيئة الـ Embeddings وقاعدة البيانات FAISS
+# ==========================================
 embeddings = DirectHFEmbeddings(model_name=EMBEDDING_MODEL_ID, token=HF_TOKEN)
 vector_store = FAISS.load_local(
     FAISS_INDEX_PATH, 
@@ -51,51 +66,85 @@ vector_store = FAISS.load_local(
     allow_dangerous_deserialization=True
 )
 
-# 4. خريطة التعبير النمطي (Regex) للتعرف على التحيات والأسئلة الشائعة
+# ==========================================
+# 4. خريطة التحيات المباشرة
+# ==========================================
 GREETINGS_MAP = {
     r"^(مرحبا|مرحباً|أهلا|أهلاً|اهلين|أهلين|السلام عليكم|مرحبتين|هلا|صباح الخير|مساء الخير)": 
-        "أهلاً بك! كيف يمكنني مساعدتك اليوم في البحث داخل قاعدة البيانات؟",
+        "أهلاً بك! أنا المساعد الذكي للمديرية العامة لتربية نينوى. كيف يمكنني مساعدتك اليوم؟",
         
     r"^(من انت|من أنت|عرف عن نفسك|ما هو عملك|ماذا تفعل)": 
-        "أنا مساعد ذكي مخصص للبحث في المستندات والرد على استفساراتك بناءً على البيانات المتاحة.",
+        "أنا مساعد ذكي مخصص للإجابة عن استفسارات الموظفين والمراجعين الخاصة بالمديرية العامة لتربية نينوى.",
         
     r"^(شكرا|شكراً|يعطيك العافية|تسلم|تسلم ايدك|مشكور)": 
-        "العفو! أنا في الخدمة دائماً. هل لديك أي استفسار آخر؟"
+        "العفو! أنا في الخدمة دائماً. هل لديك أي استفسار إداري آخر؟"
 }
 
 class QueryRequest(BaseModel):
     query: str
 
+# ==========================================
+# 5. نقطة النهاية (Endpoint) للبث المباشر
+# ==========================================
 @app.post("/search-stream")
 async def search_stream(req: QueryRequest):
     user_query = req.query.strip()
 
-    # أولاً: الفحص والرد الفوري إذا كان المدخل تحية أو سؤال عام
+    # أولاً: الرد السريع المباشر للتحيات
     for pattern, response_text in GREETINGS_MAP.items():
         if re.search(pattern, user_query, re.IGNORECASE):
             async def greeting_generator():
                 for word in response_text.split(" "):
                     yield {"data": word + " "}
-                    await asyncio.sleep(0.03)  # سرعة تدفّق الكلمات
+                    await asyncio.sleep(0.02)
             return EventSourceResponse(greeting_generator())
 
-    # ثانياً: إذا لم تكن تحية، الانتقال للبحث الفعلي في FAISS
+    # ثانياً: البحث في FAISS ثم استدعاء نموذج Ling-3.0-flash
     try:
         docs = await asyncio.to_thread(
-            vector_store.similarity_search, user_query, k=1
+            vector_store.similarity_search, user_query, k=2
         )
         
-        async def event_generator():
-            if docs:
-                full_text = docs[0].page_content
-                words = full_text.split(" ")
-                for word in words:
-                    yield {"data": word + " "}
-                    await asyncio.sleep(0.03)
-            else:
-                yield {"data": "عذراً، هذه المعلومة غير متوفرة في قاعدة البيانات المتاحة لدي."}
+        context = "\n\n".join([d.page_content for d in docs]) if docs else "لا يوجد سياق متوفر."
 
-        return EventSourceResponse(event_generator())
+        # تعليمات حازمة لمنع كتابة الأكواد بجميع أشكالها
+        system_instruction = f"""أنت مساعد خدمة العملاء والمراجعين في المديرية العامة لتربية نينوى.
+
+تعليمات صارمة:
+1. أجب باللغة العربية الفصحى وبطريقة إدارية ودودة وبسيطة.
+2. يُمنع منعاً باتاً كتابة أي أسطر أو كتل برمجية (مثل Python, HTML, JS) أو استخدام التنسيق البرمجي (```).
+3. أجب عن سؤال المستخدم بالاعتماد حصراً على السياق المرفق أدناه، وإذا لم توجد الإجابة وضّح ذلك بلباقة.
+
+السياق المتاح:
+{context}"""
+
+        async def llm_generator():
+            try:
+                stream_response = await llm_client.chat.completions.create(
+                    model="inclusionai/ling-3.0-flash",
+                    extra_headers={
+                        "HTTP-Referer": "https://localhost",
+                        "X-Title": "Nineveh Edu Chatbot",
+                    },
+                    extra_body={
+                        "reasoning": {"enabled": False}  # إيقاف التفكير الداخلي لإلغاء الأكواد وزيادة السرعة
+                    },
+                    messages=[
+                        {"role": "system", "content": system_instruction},
+                        {"role": "user", "content": user_query}
+                    ],
+                    stream=True
+                )
+
+                async for chunk in stream_response:
+                    if chunk.choices and chunk.choices[0].delta.content:
+                        token = chunk.choices[0].delta.content
+                        yield {"data": token}
+
+            except Exception as inner_e:
+                yield {"data": f"\n[خطأ في الاتصال بالنموذج: {str(inner_e)}]"}
+
+        return EventSourceResponse(llm_generator())
         
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
