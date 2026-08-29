@@ -17,14 +17,14 @@ app = FastAPI(title="RAG Streaming Backend - Nineveh Edu")
 # 1. إعداد المتغيرات والمفاتيح
 # ==========================================
 HF_TOKEN = os.environ.get("HF_TOKEN")
-OPENROUTER_API_KEY = os.environ.get("OPENROUTER_API_KEY")
+TOGETHER_API_KEY = os.environ.get("TOGETHER_API_KEY") # تم التغيير لـ Together AI Key
 EMBEDDING_MODEL_ID = "BAAI/bge-m3"
 FAISS_INDEX_PATH = "faiss_index"
 
-# تهيئة عميل OpenRouter (AsyncOpenAI)
+# تهيئة عميل Together AI عبر AsyncOpenAI (يدعم OpenAI Compatibility)
 llm_client = AsyncOpenAI(
-    base_url="https://openrouter.ai/api/v1",
-    api_key=OPENROUTER_API_KEY,
+    base_url="https://api.together.ai/v1",
+    api_key=TOGETHER_API_KEY,
 )
 
 # ==========================================
@@ -99,7 +99,7 @@ async def search_stream(req: QueryRequest):
                     await asyncio.sleep(0.02)
             return EventSourceResponse(greeting_generator())
 
-    # ثانياً: البحث في FAISS ثم استدعاء نموذج Ling-3.0-flash
+    # ثانياً: البحث في FAISS ثم استدعاء نموذج GLM-5.3-Flash من Together AI
     try:
         docs = await asyncio.to_thread(
             vector_store.similarity_search, user_query, k=2
@@ -121,14 +121,7 @@ async def search_stream(req: QueryRequest):
         async def llm_generator():
             try:
                 stream_response = await llm_client.chat.completions.create(
-                    model="inclusionai/ling-3.0-flash",
-                    extra_headers={
-                        "HTTP-Referer": "https://localhost",
-                        "X-Title": "Nineveh Edu Chatbot",
-                    },
-                    extra_body={
-                        "reasoning": {"enabled": False}  # إيقاف التفكير الداخلي لإلغاء الأكواد وزيادة السرعة
-                    },
+                    model="zai-org/GLM-5.3-Flash",  # تم تغيير النموذج إلى GLM-5.3-Flash
                     messages=[
                         {"role": "system", "content": system_instruction},
                         {"role": "user", "content": user_query}
