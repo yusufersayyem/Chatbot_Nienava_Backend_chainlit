@@ -5,10 +5,11 @@ import re
 from typing import List
 
 from fastapi import FastAPI, HTTPException
+from google import genai
+from google.genai import types
 from huggingface_hub import InferenceClient
 from langchain_community.vectorstores import FAISS
 from langchain_core.embeddings import Embeddings
-from openai import AsyncOpenAI
 from pydantic import BaseModel
 from sse_starlette.sse import EventSourceResponse
 
@@ -18,14 +19,16 @@ app = FastAPI(title="RAG Streaming Backend - Nineveh Edu")
 # 1. إعداد المتغيرات والمفاتيح
 # ==========================================
 HF_TOKEN = os.environ.get("HF_TOKEN")
-TOGETHER_API_KEY = os.environ.get("TOGETHER_API_KEY")
+TEAMOROUTER_API_KEY = os.environ.get("TEAMOROUTER_API_KEY")
 EMBEDDING_MODEL_ID = "BAAI/bge-m3"
 FAISS_INDEX_PATH = "faiss_index"
 
-# تهيئة عميل Together AI عبر AsyncOpenAI
-llm_client = AsyncOpenAI(
-    base_url="https://api.together.ai/v1",
-    api_key=TOGETHER_API_KEY,
+# تهيئة عميل Google GenAI SDK بـ Base URL مخصص
+llm_client = genai.Client(
+    api_key=TEAMOROUTER_API_KEY,
+    http_options=types.HttpOptions(
+        base_url="https://api.teamorouter.com"
+    )
 )
 
 
@@ -116,7 +119,7 @@ async def search_stream(req: QueryRequest):
 
             return EventSourceResponse(greeting_generator())
 
-    # ثانياً: البحث في FAISS ثم استدعاء Llama 3.1 8B عبر Together AI
+    # ثانياً: البحث في FAISS ثم استدعاء النموذج عبر Gemini SDK
     try:
         docs = await asyncio.to_thread(
             vector_store.similarity_search, user_query, k=3
@@ -128,7 +131,6 @@ async def search_stream(req: QueryRequest):
             else "لا يوجد سياق متوفر."
         )
 
-        # تعليمات حازمة ومخصصة لـ Llama 3.1 لضمان التزامه بالعربية والسياق الإداري
         system_instruction = f"""أنت مساعد رسمي مخصص لخدمة العملاء والمراجعين في المديرية العامة لتربية نينوى.
 
 تعليمات صارمة يجب الالتزام بها:
@@ -140,23 +142,27 @@ async def search_stream(req: QueryRequest):
 السياق المتاح:
 {context}"""
 
+        # دالة جلب Stream متزامنة لتنفيذها داخل Thread منفصل
+        def get_gemini_stream():
+            return llm_client.models.generate_content_stream(
+                model="gemini-2.5-flash",  # استبدله باسم النموذج المدعوم لدى منصة Teamorouter
+                contents=user_query,
+                config=types.GenerateContentConfig(
+                    system_instruction=system_instruction,
+                    temperature=0.2,
+                ),
+            )
+
         async def llm_generator():
             try:
-                # استخدام النموذج الرسمي Llama 3.1 8B Instruct Turbo من Together AI
-                stream_response = await llm_client.chat.completions.create(
-                    model="meta-llama/Meta-Llama-3.1-8B-Instruct-Turbo",
-                    messages=[
-                        {"role": "system", "content": system_instruction},
-                        {"role": "user", "content": user_query},
-                    ],
-                    temperature=0.2,  # خفض درجة الابتكار لمنع التخيل وتأكيد الالتزام بالسياق
-                    stream=True,
-                )
+                # تشغيل استدعاء API المزامَن داخل Thread لتجنب Blocking لـ Event Loop
+                response_stream = await asyncio.to_thread(get_gemini_stream)
 
-                async for chunk in stream_response:
-                    if chunk.choices and chunk.choices[0].delta.content:
-                        token = chunk.choices[0].delta.content
-                        yield {"data": token}
+                for chunk in response_stream:
+                    if chunk.text:
+                        yield {"data": chunk.text}
+                        # انتظار بسيط لضمان سلاسة إرسال الـ SSE
+                        await asyncio.sleep(0.01)
 
             except Exception as inner_e:
                 yield {"data": f"\n[خطأ في الاتصال بالنموذج: {str(inner_e)}]"}
