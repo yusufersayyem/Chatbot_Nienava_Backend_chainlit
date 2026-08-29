@@ -4,7 +4,7 @@ import re
 from typing import List
 
 from fastapi import FastAPI, HTTPException
-from groq import AsyncGroq  # تم استيراد العميل غير المتزامن لـ Groq
+from groq import AsyncGroq
 from huggingface_hub import InferenceClient
 from langchain_community.vectorstores import FAISS
 from langchain_core.embeddings import Embeddings
@@ -17,7 +17,7 @@ app = FastAPI(title="RAG Streaming Backend - Nineveh Edu")
 # 1. إعداد المتغيرات والمفاتيح
 # ==========================================
 HF_TOKEN = os.environ.get("HF_TOKEN")
-GROQ_API_KEY = os.environ.get("GROQ_API_KEY")  # تم تغيير اسم المفتاح لـ Groq
+GROQ_API_KEY = os.environ.get("GROQ_API_KEY")
 EMBEDDING_MODEL_ID = "BAAI/bge-m3"
 FAISS_INDEX_PATH = "faiss_index"
 
@@ -112,7 +112,7 @@ async def search_stream(req: QueryRequest):
 
             return EventSourceResponse(greeting_generator())
 
-    # ثانياً: البحث في FAISS ثم استدعاء النموذج عبر Groq API
+    # ثانياً: البحث في FAISS ثم استدعاء نموذج gpt-oss-120b عبر Groq API
     try:
         docs = await asyncio.to_thread(
             vector_store.similarity_search, user_query, k=3
@@ -137,9 +137,9 @@ async def search_stream(req: QueryRequest):
 
         async def llm_generator():
             try:
-                # استدعاء Groq API بشكل Native Async مباشر
+                # استدعاء Groq API باستخدام النموذج الذي اخترته
                 response_stream = await groq_client.chat.completions.create(
-                    model="llama-3.3-70b-versatile",  # نموذج ممتاز ويدعم العربية بشكل قوي في Groq
+                    model="openai/gpt-oss-120b",
                     messages=[
                         {"role": "system", "content": system_instruction},
                         {"role": "user", "content": user_query},
