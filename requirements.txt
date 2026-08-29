@@ -1,9 +1,8 @@
 fastapi
 uvicorn
+google-genai
 sse-starlette
 huggingface_hub
-langchain-core
 langchain-community
 faiss-cpu
-openai
 pydantic
