@@ -1,12 +1,10 @@
 import asyncio
-import json
 import os
 import re
 from typing import List
 
 from fastapi import FastAPI, HTTPException
-from google import genai
-from google.genai import types
+from groq import AsyncGroq  # تم استيراد العميل غير المتزامن لـ Groq
 from huggingface_hub import InferenceClient
 from langchain_community.vectorstores import FAISS
 from langchain_core.embeddings import Embeddings
@@ -19,17 +17,12 @@ app = FastAPI(title="RAG Streaming Backend - Nineveh Edu")
 # 1. إعداد المتغيرات والمفاتيح
 # ==========================================
 HF_TOKEN = os.environ.get("HF_TOKEN")
-TEAMOROUTER_API_KEY = os.environ.get("TEAMOROUTER_API_KEY")
+GROQ_API_KEY = os.environ.get("GROQ_API_KEY")  # تم تغيير اسم المفتاح لـ Groq
 EMBEDDING_MODEL_ID = "BAAI/bge-m3"
 FAISS_INDEX_PATH = "faiss_index"
 
-# تهيئة عميل Google GenAI SDK بـ Base URL مخصص
-llm_client = genai.Client(
-    api_key=TEAMOROUTER_API_KEY,
-    http_options=types.HttpOptions(
-        base_url="https://api.teamorouter.com"
-    )
-)
+# تهيئة عميل Groq غير المتزامن (AsyncGroq)
+groq_client = AsyncGroq(api_key=GROQ_API_KEY)
 
 
 # ==========================================
@@ -119,7 +112,7 @@ async def search_stream(req: QueryRequest):
 
             return EventSourceResponse(greeting_generator())
 
-    # ثانياً: البحث في FAISS ثم استدعاء النموذج عبر Gemini SDK
+    # ثانياً: البحث في FAISS ثم استدعاء النموذج عبر Groq API
     try:
         docs = await asyncio.to_thread(
             vector_store.similarity_search, user_query, k=3
@@ -142,26 +135,24 @@ async def search_stream(req: QueryRequest):
 السياق المتاح:
 {context}"""
 
-        # دالة جلب Stream متزامنة لتنفيذها داخل Thread منفصل
-        def get_gemini_stream():
-            return llm_client.models.generate_content_stream(
-                model="gemini-2.5-flash",  # استبدله باسم النموذج المدعوم لدى منصة Teamorouter
-                contents=user_query,
-                config=types.GenerateContentConfig(
-                    system_instruction=system_instruction,
-                    temperature=0.2,
-                ),
-            )
-
         async def llm_generator():
             try:
-                # تشغيل استدعاء API المزامَن داخل Thread لتجنب Blocking لـ Event Loop
-                response_stream = await asyncio.to_thread(get_gemini_stream)
+                # استدعاء Groq API بشكل Native Async مباشر
+                response_stream = await groq_client.chat.completions.create(
+                    model="llama-3.3-70b-versatile",  # نموذج ممتاز ويدعم العربية بشكل قوي في Groq
+                    messages=[
+                        {"role": "system", "content": system_instruction},
+                        {"role": "user", "content": user_query},
+                    ],
+                    temperature=0.2,
+                    max_completion_tokens=2048,
+                    stream=True,
+                )
 
-                for chunk in response_stream:
-                    if chunk.text:
-                        yield {"data": chunk.text}
-                        # انتظار بسيط لضمان سلاسة إرسال الـ SSE
+                async for chunk in response_stream:
+                    content = chunk.choices[0].delta.content
+                    if content:
+                        yield {"data": content}
                         await asyncio.sleep(0.01)
 
             except Exception as inner_e:
