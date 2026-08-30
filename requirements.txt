@@ -1,6 +1,6 @@
 fastapi
 uvicorn
-groq
+openai
 sse-starlette
 huggingface_hub
 langchain-community
