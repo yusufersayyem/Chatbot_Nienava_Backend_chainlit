@@ -2,12 +2,11 @@ import asyncio
 import os
 import re
 from typing import List
-
 from fastapi import FastAPI, HTTPException
-from groq import AsyncGroq
 from huggingface_hub import InferenceClient
 from langchain_community.vectorstores import FAISS
 from langchain_core.embeddings import Embeddings
+from openai import AsyncOpenAI
 from pydantic import BaseModel
 from sse_starlette.sse import EventSourceResponse
 
@@ -17,12 +16,14 @@ app = FastAPI(title="RAG Streaming Backend - Nineveh Edu")
 # 1. إعداد المتغيرات والمفاتيح
 # ==========================================
 HF_TOKEN = os.environ.get("HF_TOKEN")
-GROQ_API_KEY = os.environ.get("GROQ_API_KEY")
 EMBEDDING_MODEL_ID = "BAAI/bge-m3"
 FAISS_INDEX_PATH = "faiss_index"
 
-# تهيئة عميل Groq غير المتزامن (AsyncGroq)
-groq_client = AsyncGroq(api_key=GROQ_API_KEY)
+# تهيئة عميل OpenAI الموجه نحو Hugging Face Router
+hf_router_client = AsyncOpenAI(
+    base_url="https://router.huggingface.co/v1",
+    api_key=HF_TOKEN,
+)
 
 
 # ==========================================
@@ -112,7 +113,7 @@ async def search_stream(req: QueryRequest):
 
             return EventSourceResponse(greeting_generator())
 
-    # ثانياً: البحث في FAISS ثم استدعاء نموذج gpt-oss-120b عبر Groq API
+    # ثانياً: البحث في FAISS ثم استدعاء نموذج Ling-3.0-flash عبر Hugging Face Router
     try:
         docs = await asyncio.to_thread(
             vector_store.similarity_search, user_query, k=3
@@ -137,23 +138,22 @@ async def search_stream(req: QueryRequest):
 
         async def llm_generator():
             try:
-                # استدعاء Groq API باستخدام النموذج الذي اخترته
-                response_stream = await groq_client.chat.completions.create(
-                    model="openai/gpt-oss-120b",
+                # استدعاء نموذج Ling-3.0-flash عبر Hugging Face Router API
+                response_stream = await hf_router_client.chat.completions.create(
+                    model="inclusionAI/Ling-3.0-flash:novita",
                     messages=[
                         {"role": "system", "content": system_instruction},
                         {"role": "user", "content": user_query},
                     ],
                     temperature=0.2,
-                    max_completion_tokens=2048,
+                    max_tokens=2048,
                     stream=True,
                 )
 
                 async for chunk in response_stream:
-                    content = chunk.choices[0].delta.content
-                    if content:
+                    if chunk.choices and chunk.choices[0].delta.content:
+                        content = chunk.choices[0].delta.content
                         yield {"data": content}
-                        await asyncio.sleep(0.01)
 
             except Exception as inner_e:
                 yield {"data": f"\n[خطأ في الاتصال بالنموذج: {str(inner_e)}]"}
