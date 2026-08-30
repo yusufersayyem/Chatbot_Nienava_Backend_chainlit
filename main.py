@@ -2,7 +2,7 @@ import asyncio
 import os
 import re
 from typing import List
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI
 from huggingface_hub import InferenceClient
 from langchain_community.vectorstores import FAISS
 from langchain_core.embeddings import Embeddings
@@ -69,15 +69,19 @@ class DirectHFEmbeddings(Embeddings):
 # 3. تهيئة الـ Embeddings وقاعدة البيانات FAISS
 # ==========================================
 embeddings = DirectHFEmbeddings(model_name=EMBEDDING_MODEL_ID, token=HF_TOKEN)
-vector_store = FAISS.load_local(
-    FAISS_INDEX_PATH, embeddings, allow_dangerous_deserialization=True
-)
+try:
+    vector_store = FAISS.load_local(
+        FAISS_INDEX_PATH, embeddings, allow_dangerous_deserialization=True
+    )
+except Exception as e:
+    print(f"تحذير: تعذر تحميل FAISS Index: {e}")
+    vector_store = None
 
 # ==========================================
 # 4. خريطة التحيات المباشرة
 # ==========================================
 GREETINGS_MAP = {
-    r"^(مرحبا|مرحباً|أهلا|أهلاً|اهلين|أهلين|السلام عليكم|مرحبتين|هلا|صباح الخير|مساء الخير)": (
+    r"^(مرحبا|مرحباً|أاهلا|أهلاً|اهلين|أهلين|السلام عليكم|مرحبتين|هلا|صباح الخير|مساء الخير)": (
         "أهلاً بك! أنا المساعد الذكي للمديرية العامة لتربية نينوى. كيف"
         " يمكنني مساعدتك اليوم؟"
     ),
@@ -113,19 +117,22 @@ async def search_stream(req: QueryRequest):
 
             return EventSourceResponse(greeting_generator())
 
-    # ثانياً: البحث في FAISS ثم استدعاء نموذج Ling-3.0-flash عبر Hugging Face Router
-    try:
-        docs = await asyncio.to_thread(
-            vector_store.similarity_search, user_query, k=3
-        )
+    # ثانياً: البحث في FAISS ثم استدعاء النموذج عبر مولد الـ SSE
+    async def llm_generator():
+        try:
+            # البحث في FAISS
+            context = "لا يوجد سياق متوفر."
+            if vector_store:
+                try:
+                    docs = await asyncio.to_thread(
+                        vector_store.similarity_search, user_query, k=3
+                    )
+                    if docs:
+                        context = "\n\n".join([d.page_content for d in docs])
+                except Exception as faiss_err:
+                    context = f"[خطأ أثناء البحث في البيانات: {str(faiss_err)}]"
 
-        context = (
-            "\n\n".join([d.page_content for d in docs])
-            if docs
-            else "لا يوجد سياق متوفر."
-        )
-
-        system_instruction = f"""أنت مساعد رسمي مخصص لخدمة العملاء والمراجعين في المديرية العامة لتربية نينوى.
+            system_instruction = f"""أنت مساعد رسمي مخصص لخدمة العملاء والمراجعين في المديرية العامة لتربية نينوى.
 
 تعليمات صارمة يجب الالتزام بها:
 1. أجب باللغة العربية الفصحى وبأسلوب إداري ورسمي ومؤدب.
@@ -136,29 +143,24 @@ async def search_stream(req: QueryRequest):
 السياق المتاح:
 {context}"""
 
-        async def llm_generator():
-            try:
-                # استدعاء نموذج Ling-3.0-flash عبر Hugging Face Router API
-                response_stream = await hf_router_client.chat.completions.create(
-                    model="inclusionAI/Ling-3.0-flash:novita",
-                    messages=[
-                        {"role": "system", "content": system_instruction},
-                        {"role": "user", "content": user_query},
-                    ],
-                    temperature=0.2,
-                    max_tokens=2048,
-                    stream=True,
-                )
+            # استدعاء نموذج الذكاء الاصطناعي
+            response_stream = await hf_router_client.chat.completions.create(
+                model="inclusionAI/Ling-3.0-flash:novita",
+                messages=[
+                    {"role": "system", "content": system_instruction},
+                    {"role": "user", "content": user_query},
+                ],
+                temperature=0.2,
+                max_tokens=2048,
+                stream=True,
+            )
 
-                async for chunk in response_stream:
-                    if chunk.choices and chunk.choices[0].delta.content:
-                        content = chunk.choices[0].delta.content
-                        yield {"data": content}
+            async for chunk in response_stream:
+                if chunk.choices and chunk.choices[0].delta.content:
+                    content = chunk.choices[0].delta.content
+                    yield {"data": content}
 
-            except Exception as inner_e:
-                yield {"data": f"\n[خطأ في الاتصال بالنموذج: {str(inner_e)}]"}
+        except Exception as inner_e:
+            yield {"data": f"\n⚠️ [حدث خطأ في معالجة الطلب: {str(inner_e)}]"}
 
-        return EventSourceResponse(llm_generator())
-
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+    return EventSourceResponse(llm_generator())
