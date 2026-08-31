@@ -1,79 +1,50 @@
 import asyncio
+import json
 import os
 import re
-from typing import List
+from typing import Any, Dict, List
 
 from fastapi import FastAPI
-from huggingface_hub import InferenceClient
-from langchain_community.vectorstores import FAISS
-from langchain_core.embeddings import Embeddings
 from pydantic import BaseModel
 from sse_starlette.sse import EventSourceResponse
 
-app = FastAPI(title="FAISS Search Backend - Nineveh Edu")
+app = FastAPI(title="JSON Search Backend - Nineveh Edu")
 
 # ==========================================
-# 1. إعداد المتغيرات والمفاتيح
+# 1. تحميل ملفات الـ JSON عند بداية التشغيل
 # ==========================================
-HF_TOKEN = os.environ.get("HF_TOKEN")
-
-EMBEDDING_MODEL_ID = "BAAI/bge-m3"
-FAISS_INDEX_PATH = "faiss_index"
+JSON_FILES = ["data1.json", "data2.json", "data3.json", "data4.json", "data5.json"]
+loaded_data: List[Dict[str, Any]] = []
 
 
-# ==========================================
-# 2. كلاس الـ Embeddings الخاص بـ HuggingFace
-# ==========================================
-class DirectHFEmbeddings(Embeddings):
+def load_all_json_files():
+    """تحميل كافة ملفات JSON إلى الذاكرة لضمان سرعة الاستجابة."""
+    global loaded_data
+    loaded_data = []
 
-    def __init__(self, model_name: str, token: str):
-        self.client = InferenceClient(model=model_name, token=token)
+    for file_name in JSON_FILES:
+        if os.path.exists(file_name):
+            try:
+                with open(file_name, "r", encoding="utf-8") as f:
+                    content = json.load(f)
+                    # دعم كل من المصفوفات (List) والكائنات (Dict)
+                    if isinstance(content, list):
+                        for item in content:
+                            loaded_data.append({"file": file_name, "content": item})
+                    else:
+                        loaded_data.append({"file": file_name, "content": content})
+                print(f"تم تحميل الملف بنجاح: {file_name}")
+            except Exception as e:
+                print(f"خطأ أثناء قراءة الملف {file_name}: {e}")
+        else:
+            print(f"تحذير: الملف غير موجود -> {file_name}")
 
-    def _process_response(self, response) -> List[float]:
-        if hasattr(response, "tolist"):
-            response = response.tolist()
 
-        while (
-            isinstance(response, list)
-            and len(response) > 0
-            and isinstance(response[0], list)
-        ):
-            if isinstance(response[0][0], list):
-                response = response[0]
-            else:
-                break
-
-        if (
-            isinstance(response, list)
-            and len(response) > 0
-            and isinstance(response[0], list)
-        ):
-            response = [sum(col) / len(response) for col in zip(*response)]
-
-        return response
-
-    def embed_documents(self, texts: List[str]) -> List[List[float]]:
-        return [self.embed_query(text) for text in texts]
-
-    def embed_query(self, text: str) -> List[float]:
-        response = self.client.feature_extraction(text)
-        return self._process_response(response)
-
+# استدعاء دالة التحميل
+load_all_json_files()
 
 # ==========================================
-# 3. تهيئة الـ Embeddings وقاعدة البيانات FAISS
-# ==========================================
-embeddings = DirectHFEmbeddings(model_name=EMBEDDING_MODEL_ID, token=HF_TOKEN)
-try:
-    vector_store = FAISS.load_local(
-        FAISS_INDEX_PATH, embeddings, allow_dangerous_deserialization=True
-    )
-except Exception as e:
-    print(f"تحذير: تعذر تحميل FAISS Index: {e}")
-    vector_store = None
-
-# ==========================================
-# 4. خريطة التحيات المباشرة
+# 2. خريطة التحيات المباشرة
 # ==========================================
 GREETINGS_MAP = {
     r"^(مرحبا|مرحباً|أاهلا|أهلاً|اهلين|أهلين|السلام عليكم|مرحبتين|هلا|صباح الخير|مساء الخير)": (
@@ -95,13 +66,54 @@ class QueryRequest(BaseModel):
 
 
 # ==========================================
-# 5. نقاط النهاية (Endpoints)
+# 3. دالة البحث النصي داخل بيانات JSON
+# ==========================================
+def search_in_json(query: str) -> List[str]:
+    """تقتفي أثر الكلمات المفتاحية في كل كائن/مستند داخل بيانات JSON."""
+    results = []
+    keywords = [k.lower() for k in query.split() if len(k) > 1]
+
+    if not keywords:
+        return results
+
+    for record in loaded_data:
+        # تحويل محتوى الـ JSON بالكامل إلى نص واحد لإجراء البحث المباشر
+        text_content = json.dumps(record["content"], ensure_ascii=False)
+        text_lower = text_content.lower()
+
+        # حساب عدد الكلمات المفتاحية المطابقة
+        matches = sum(1 for kw in keywords if kw in text_lower)
+
+        if matches > 0:
+            # إذا كان العنصر عبارة عن كائن يحتوي على حقول نصية، استخرج النص بشكل منسق
+            if isinstance(record["content"], dict):
+                formatted_item = "\n".join(
+                    [f"**{k}**: {v}" for k, v in record["content"].items()]
+                )
+            else:
+                formatted_item = str(record["content"])
+
+            results.append((matches, formatted_item))
+
+    # ترتيب النتائج بناءً على الأكثر مطابقة للكلمات المفتاحية
+    results.sort(key=lambda x: x[0], reverse=True)
+
+    # إرجاع أعلى 5 نتائج فقط لتجنب الإطالة
+    return [res[1] for res in results[:5]]
+
+
+# ==========================================
+# 4. نقاط النهاية (Endpoints)
 # ==========================================
 
 
 @app.get("/health")
 async def health_check():
-    return {"status": "ok", "message": "Server is active"}
+    return {
+        "status": "ok",
+        "loaded_records": len(loaded_data),
+        "message": "Server is active",
+    }
 
 
 @app.post("/search-stream")
@@ -119,41 +131,41 @@ async def search_stream(req: QueryRequest):
 
             return EventSourceResponse(greeting_generator())
 
-    # ثانياً: البحث المباشر في FAISS وبث النتيجة مباشرة
-    async def faiss_generator():
+    # ثانياً: البحث المباشر في ملفات JSON وبث النتيجة
+    async def json_generator():
         try:
-            if not vector_store:
+            if not loaded_data:
                 yield {
                     "data": (
-                        "عذراً، قاعدة البيانات (FAISS Index) غير متوفرة"
-                        " حالياً."
+                        "عذراً، لم يتم تحميل أي بيانات من ملفات JSON في"
+                        " النظام."
                     )
                 }
                 return
 
-            # إتمام البحث في خيط منفصل (Thread) لتجنب تجميد Event Loop
-            docs = await asyncio.to_thread(
-                vector_store.similarity_search, user_query, k=3
+            # إجراء البحث في خيط منفصل (Thread) لتجنب تجميد Event Loop
+            matched_results = await asyncio.to_thread(
+                search_in_json, user_query
             )
 
-            if not docs:
+            if not matched_results:
                 yield {
                     "data": (
                         "عذراً، لم أجد أي معلومات مطابقة لاستفسارك في"
-                        " المستندات المتاحة."
+                        " البيانات المتاحة."
                     )
                 }
                 return
 
-            # دمج النصوص المستخرجة من FAISS
-            extracted_text = "\n\n---\n\n".join([d.page_content for d in docs])
+            # دمج النصوص المستخرجة
+            extracted_text = "\n\n---\n\n".join(matched_results)
 
-            # محاكاة البث (Streaming) كلمة بكلمة لتبقى واجهة الـ Frontend تعمل بسلاسة
+            # محاكاة البث (Streaming) كلمة بكلمة
             for word in extracted_text.split(" "):
                 yield {"data": word + " "}
-                await asyncio.sleep(0.005)  # سرعة البث
+                await asyncio.sleep(0.005)
 
         except Exception as err:
             yield {"data": f"\n⚠️ [حدث خطأ أثناء البحث: {str(err)}]"}
 
-    return EventSourceResponse(faiss_generator())
+    return EventSourceResponse(json_generator())
