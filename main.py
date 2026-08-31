@@ -5,42 +5,61 @@ import re
 from typing import Any, Dict, List
 
 from fastapi import FastAPI
+from huggingface_hub import InferenceClient
+import numpy as np
 from pydantic import BaseModel
 from sse_starlette.sse import EventSourceResponse
 
-app = FastAPI(title="Normalized JSON Search Backend - Nineveh Edu")
+app = FastAPI(title="HuggingFace BGE-M3 API Search - Nineveh Edu")
 
 # ==========================================
-# 1. تحديد مسارات الملفات وتحميل البيانات
+# 1. الإعدادات والتهيئات
 # ==========================================
+HF_TOKEN = os.environ.get("HF_TOKEN")  # قم بإضافة مفتاح HuggingFace في متغيرات البيئة
+EMBEDDING_MODEL_ID = "BAAI/bge-m3"
+
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 DATA_DIR = os.path.join(BASE_DIR, "loaded_data")
-
 JSON_FILES = ["data1.json", "data2.json", "data3.json", "data4.json", "data5.json"]
-loaded_data: List[Dict[str, Any]] = []
+
+# تهيئة العميل الخاص بـ Hugging Face
+hf_client = InferenceClient(model=EMBEDDING_MODEL_ID, token=HF_TOKEN)
+
+loaded_chunks: List[str] = []
+chunk_embeddings: List[List[float]] = []
 
 
-def normalize_arabic(text: str) -> str:
-    """إزالة التشكيل والتطويل وتوحيد الهمزات والأحرف العربية."""
-    if not text:
-        return ""
-    # إزالة حركات التشكيل والتنوين
-    text = re.sub(r"[\u0617-\u061A\u064B-\u0652\u0653-\u065F\u0670]", "", text)
-    # إزالة التطويل (الكشيدة)
-    text = re.sub(r"\u0640", "", text)
-    # توحيد الألفات والهمزات
-    text = re.sub(r"[أإآ]", "ا", text)
-    # توحيد الياء والتاء المربوطة
-    text = re.sub(r"ى", "ي", text)
-    text = re.sub(r"ة", "ه", text)
-    return text.lower().strip()
+def get_embedding_via_api(text: str) -> List[float]:
+    """استدعاء Hugging Face API للحصول على Vector النص."""
+    try:
+        response = hf_client.feature_extraction(text)
+        if hasattr(response, "tolist"):
+            response = response.tolist()
+
+        # معالجة استجابة الـ API وتخفيض التنعيم للأبعاد (Flattening)
+        while isinstance(response, list) and len(response) > 0 and isinstance(response[0], list):
+            if isinstance(response[0][0], list):
+                response = response[0]
+            else:
+                break
+
+        # حساب المتوسط إذا تم إرجاع متجهات لكل توكن (Token-level embeddings)
+        if isinstance(response, list) and len(response) > 0 and isinstance(response[0], list):
+            response = [sum(col) / len(response) for col in zip(*response)]
+
+        return response
+    except Exception as e:
+        print(f"❌ خطأ في الحصول على التضمين من API للمتن: {e}")
+        return []
 
 
-def load_all_json_files():
-    """تحميل كافة ملفات JSON إلى الذاكرة لضمان السرعة الأقصى."""
-    global loaded_data
-    loaded_data = []
+def prepare_and_embed_data():
+    """تحميل النصوص وحساب المتجهات عبر API لمرة واحدة عند بدء تشغيل الخادم."""
+    global loaded_chunks, chunk_embeddings
+    loaded_chunks = []
+    chunk_embeddings = []
 
+    raw_texts = []
     for file_name in JSON_FILES:
         file_path = os.path.join(DATA_DIR, file_name)
         if os.path.exists(file_path):
@@ -49,28 +68,43 @@ def load_all_json_files():
                     content = json.load(f)
                     items = content if isinstance(content, list) else [content]
                     for item in items:
-                        loaded_data.append({"file": file_name, "content": item})
-                print(f"✅ تم تحميل الملف بنجاح: {file_name}")
+                        if isinstance(item, dict):
+                            formatted_str = "\n".join([f"{k}: {v}" for k, v in item.items()])
+                        else:
+                            formatted_str = str(item)
+                        raw_texts.append(formatted_str)
+                print(f"✅ تم تحميل النصوص من: {file_name}")
             except Exception as e:
                 print(f"❌ خطأ أثناء قراءة {file_name}: {e}")
-        else:
-            print(f"⚠️ الملف غير موجود -> {file_path}")
+
+    loaded_chunks = raw_texts
+    if loaded_chunks:
+        print(f"⏳ جاري استخراج Embeddings لـ ({len(loaded_chunks)}) نص عبر Hugging Face API...")
+        for i, text in enumerate(loaded_chunks):
+            emb = get_embedding_via_api(text)
+            if emb:
+                chunk_embeddings.append(emb)
+            else:
+                # إضافة متجه أصفار مؤقت إذا فشل الطلب لتجنب الاختلال
+                chunk_embeddings.append([0.0] * 1024)
+            # تجنب تجاوز حدود الاستدعاءات (Rate Limits)
+            asyncio.run(asyncio.sleep(0.05))
+
+        print("✅ اكتمل استخراج المتجهات من API بنجاح.")
 
 
-# تشغيل التحميل عند الإقلاع
-load_all_json_files()
+# قراءة البيانات والتضمينات عند تشغيل الخادم
+prepare_and_embed_data()
 
 # ==========================================
-# 2. خريطة التحيات
+# 2. خريطة التحيات المباشرة
 # ==========================================
 GREETINGS_MAP = {
     r"^(مرحبا|مرحباً|أاهلا|أهلاً|اهلين|أهلين|السلام عليكم|مرحبتين|هلا|صباح الخير|مساء الخير)": (
-        "أهلاً بك! أنا المساعد الذكي للمديرية العامة لتربية نينوى. كيف"
-        " يمكنني مساعدتك اليوم؟"
+        "أهلاً بك! أنا المساعد الذكي للمديرية العامة لتربية نينوى. كيف يمكنني مساعدتك اليوم؟"
     ),
     r"^(من انت|من أنت|عرف عن نفسك|ما هو عملك|ماذا تفعل)": (
-        "أنا مساعد مخصص للبحث في المستندات والتعليمات الرسمية للمديرية"
-        " العامة لتربية نينوى."
+        "أنا مساعد مخصص للبحث في المستندات والتعليمات الرسمية للمديرية العامة لتربية نينوى."
     ),
     r"^(شكرا|شكراً|يعطيك العافية|تسلم|تسلم ايدك|مشكور)": (
         "العفو! أنا في الخدمة دائماً. هل لديك أي استفسار إداري آخر؟"
@@ -83,39 +117,36 @@ class QueryRequest(BaseModel):
 
 
 # ==========================================
-# 3. دالة البحث النصي ذكية الأوزان
+# 3. دالة البحث الدلالي باستخدام API التشابه
 # ==========================================
-def search_in_json(query: str) -> List[str]:
+def semantic_search(query: str, top_k: int = 5) -> List[str]:
+    if not chunk_embeddings or len(loaded_chunks) == 0:
+        return []
+
+    # 1. استدعاء API لحساب متجهات نص استعلام المستخدم
+    query_vec = get_embedding_via_api(query)
+    if not query_vec:
+        return []
+
+    # 2. حساب نسبة التشابه جيب التمام (Cosine Similarity)
+    query_np = np.array(query_vec)
+    chunks_np = np.array(chunk_embeddings)
+
+    # التطبيع للحصول على نتائج أدق
+    query_norm = query_np / (np.linalg.norm(query_np) + 1e-10)
+    chunks_norm = chunks_np / (np.linalg.norm(chunks_np, axis=1, keepdims=True) + 1e-10)
+
+    similarities = np.dot(chunks_norm, query_norm)
+
+    # 3. ترتيب وتصنيف النتائج
+    top_indices = np.argsort(similarities)[::-1][:top_k]
+
     results = []
-    norm_query = normalize_arabic(query)
-    keywords = [k for k in norm_query.split() if len(k) > 1]
+    for idx in top_indices:
+        if similarities[idx] > 0.30:  # عتبة قبول النتيجة
+            results.append(loaded_chunks[idx])
 
-    if not keywords:
-        return results
-
-    for record in loaded_data:
-        raw_text = json.dumps(record["content"], ensure_ascii=False)
-        norm_text = normalize_arabic(raw_text)
-
-        score = 0
-        for kw in keywords:
-            # مطابقة تامة للكلمة = 2 نقطة
-            if re.search(r"\b" + re.escape(kw) + r"\b", norm_text):
-                score += 2
-            # مطابقة جزئية = 1 نقطة
-            elif kw in norm_text:
-                score += 1
-
-        if score > 0:
-            if isinstance(record["content"], dict):
-                formatted = "\n".join([f"**{k}**: {v}" for k, v in record["content"].items()])
-            else:
-                formatted = str(record["content"])
-            results.append((score, formatted))
-
-    # ترتيب النتائج بالأعلى نقاطاً
-    results.sort(key=lambda x: x[0], reverse=True)
-    return [res[1] for res in results[:5]]
+    return results
 
 
 # ==========================================
@@ -125,8 +156,9 @@ def search_in_json(query: str) -> List[str]:
 async def health_check():
     return {
         "status": "ok",
-        "loaded_records": len(loaded_data),
-        "data_directory": DATA_DIR,
+        "loaded_records": len(loaded_chunks),
+        "embedding_model": EMBEDDING_MODEL_ID,
+        "mode": "Hugging Face Inference API",
     }
 
 
@@ -134,26 +166,26 @@ async def health_check():
 async def search_stream(req: QueryRequest):
     user_query = req.query.strip()
 
-    # أولاً: الرد السريع للتحيات
+    # أولاً: الرد السريع المباشر للتحيات
     for pattern, response_text in GREETINGS_MAP.items():
         if re.search(pattern, user_query, re.IGNORECASE):
+
             async def greeting_generator():
                 for word in response_text.split(" "):
                     yield {"data": word + " "}
                     await asyncio.sleep(0.01)
+
             return EventSourceResponse(greeting_generator())
 
-    # ثانياً: البحث والبث
+    # ثانياً: البحث الدلالي وبث النتيجة
     async def json_generator():
         try:
-            if not loaded_data:
-                yield {"data": "عذراً، لم يتم تحميل أي بيانات في النظام."}
-                return
-
-            matched_results = await asyncio.to_thread(search_in_json, user_query)
+            matched_results = await asyncio.to_thread(semantic_search, user_query, 5)
 
             if not matched_results:
-                yield {"data": "عذراً، لم أجد أي معلومات مطابقة لاستفسارك في البيانات المتاحة."}
+                yield {
+                    "data": "عذراً، لم أجد أي معلومات مطابقة لاستفسارك في البيانات المتاحة."
+                }
                 return
 
             extracted_text = "\n\n---\n\n".join(matched_results)
