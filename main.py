@@ -2,34 +2,23 @@ import asyncio
 import os
 import re
 from typing import List
+
 from fastapi import FastAPI
 from huggingface_hub import InferenceClient
 from langchain_community.vectorstores import FAISS
 from langchain_core.embeddings import Embeddings
-from openai import AsyncOpenAI
 from pydantic import BaseModel
 from sse_starlette.sse import EventSourceResponse
 
-app = FastAPI(title="RAG Streaming Backend - Nineveh Edu")
+app = FastAPI(title="FAISS Search Backend - Nineveh Edu")
 
 # ==========================================
 # 1. إعداد المتغيرات والمفاتيح
 # ==========================================
 HF_TOKEN = os.environ.get("HF_TOKEN")
-OPENROUTER_API_KEY = os.environ.get("OPENROUTER_API_KEY")
 
 EMBEDDING_MODEL_ID = "BAAI/bge-m3"
 FAISS_INDEX_PATH = "faiss_index"
-
-# تهيئة عميل AsyncOpenAI للاتصال بـ OpenRouter
-openrouter_client = AsyncOpenAI(
-    base_url="https://openrouter.ai/api/v1",
-    api_key=OPENROUTER_API_KEY,
-    default_headers={
-        "HTTP-Referer": "https://nineveh-edu.gov.iq",
-        "X-Title": "Nineveh Edu Chatbot",
-    },
-)
 
 
 # ==========================================
@@ -92,8 +81,8 @@ GREETINGS_MAP = {
         " يمكنني مساعدتك اليوم؟"
     ),
     r"^(من انت|من أنت|عرف عن نفسك|ما هو عملك|ماذا تفعل)": (
-        "أنا مساعد ذكي مخصص للإجابة عن استفسارات الموظفين والمراجعين الخاصة"
-        " بالمديرية العامة لتربية نينوى."
+        "أنا مساعد مخصص للبحث في المستندات والتعليمات الرسمية للمديرية"
+        " العامة لتربية نينوى."
     ),
     r"^(شكرا|شكراً|يعطيك العافية|تسلم|تسلم ايدك|مشكور)": (
         "العفو! أنا في الخدمة دائماً. هل لديك أي استفسار إداري آخر؟"
@@ -109,7 +98,7 @@ class QueryRequest(BaseModel):
 # 5. نقاط النهاية (Endpoints)
 # ==========================================
 
-# نقطة فحص الصحة لإبقاء السيرفر نَشِطاً عبر UptimeRobot
+
 @app.get("/health")
 async def health_check():
     return {"status": "ok", "message": "Server is active"}
@@ -130,50 +119,41 @@ async def search_stream(req: QueryRequest):
 
             return EventSourceResponse(greeting_generator())
 
-    # ثانياً: البحث في FAISS ثم استدعاء النموذج عبر مولد الـ SSE
-    async def llm_generator():
+    # ثانياً: البحث المباشر في FAISS وبث النتيجة مباشرة
+    async def faiss_generator():
         try:
-            # البحث في FAISS (البحث الموازي لتجنب تعطيل الـ Event Loop)
-            context = "لا يوجد سياق متوفر."
-            if vector_store:
-                try:
-                    docs = await asyncio.to_thread(
-                        vector_store.similarity_search, user_query, k=3
+            if not vector_store:
+                yield {
+                    "data": (
+                        "عذراً، قاعدة البيانات (FAISS Index) غير متوفرة"
+                        " حالياً."
                     )
-                    if docs:
-                        context = "\n\n".join([d.page_content for d in docs])
-                except Exception as faiss_err:
-                    context = f"[خطأ أثناء البحث في البيانات: {str(faiss_err)}]"
+                }
+                return
 
-            system_instruction = f"""أنت مساعد رسمي مخصص لخدمة العملاء والمراجعين في المديرية العامة لتربية نينوى.
-
-تعليمات صارمة يجب الالتزام بها:
-1. أجب باللغة العربية الفصحى وبأسلوب إداري ورسمي ومؤدب.
-2. اعتمد حصراً على "السياق المتاح" أدناه للإجابة عن السؤال. إذا لم توجد الإجابة في السياق، قل بلباقة: "عذراً، هذه المعلومة غير متوفرة لدي حالياً في التعليمات المتاحة."
-3. يُمنع منعاً باتاً اختلاق أي معلومات من خارج السياق.
-4. يُمنع منعاً باتاً كتابة أي أكواد برمجية (مثل Python, HTML) أو إشارات تقنية.
-
-السياق المتاح:
-{context}"""
-
-            # استدعاء النموذج عبر OpenRouter بدون قدرات الـ Reasoning لتقليل الـ Latency
-            response_stream = await openrouter_client.chat.completions.create(
-                model="inclusionai/ling-3.0-flash-fin:free",
-                messages=[
-                    {"role": "system", "content": system_instruction},
-                    {"role": "user", "content": user_query},
-                ],
-                temperature=0.2,
-                max_tokens=2048,
-                stream=True,
+            # إتمام البحث في خيط منفصل (Thread) لتجنب تجميد Event Loop
+            docs = await asyncio.to_thread(
+                vector_store.similarity_search, user_query, k=3
             )
 
-            async for chunk in response_stream:
-                if chunk.choices and chunk.choices[0].delta.content:
-                    content = chunk.choices[0].delta.content
-                    yield {"data": content}
+            if not docs:
+                yield {
+                    "data": (
+                        "عذراً، لم أجد أي معلومات مطابقة لاستفسارك في"
+                        " المستندات المتاحة."
+                    )
+                }
+                return
 
-        except Exception as inner_e:
-            yield {"data": f"\n⚠️ [حدث خطأ في معالجة الطلب: {str(inner_e)}]"}
+            # دمج النصوص المستخرجة من FAISS
+            extracted_text = "\n\n---\n\n".join([d.page_content for d in docs])
 
-    return EventSourceResponse(llm_generator())
+            # محاكاة البث (Streaming) كلمة بكلمة لتبقى واجهة الـ Frontend تعمل بسلاسة
+            for word in extracted_text.split(" "):
+                yield {"data": word + " "}
+                await asyncio.sleep(0.005)  # سرعة البث
+
+        except Exception as err:
+            yield {"data": f"\n⚠️ [حدث خطأ أثناء البحث: {str(err)}]"}
+
+    return EventSourceResponse(faiss_generator())
