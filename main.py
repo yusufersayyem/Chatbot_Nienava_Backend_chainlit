@@ -11,21 +11,30 @@ from sse_starlette.sse import EventSourceResponse
 app = FastAPI(title="JSON Search Backend - Nineveh Edu")
 
 # ==========================================
-# 1. تحميل ملفات الـ JSON عند بداية التشغيل
+# 1. تحديد مسارات الملفات وتفريغها عند التشغيل
 # ==========================================
+# تحديد مسار المجلد الذي يحتوي على ملف main.py
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+
+# تحديد المسار المطلق للمجلد الفرعي الذي يحتوي على ملفات JSON
+DATA_DIR = os.path.join(BASE_DIR, "loaded_data")
+
 JSON_FILES = ["data1.json", "data2.json", "data3.json", "data4.json", "data5.json"]
 loaded_data: List[Dict[str, Any]] = []
 
 
 def load_all_json_files():
-    """تحميل كافة ملفات JSON إلى الذاكرة لضمان سرعة الاستجابة."""
+    """تحميل كافة ملفات JSON من مجلد loaded_data إلى الذاكرة لضمان سرعة الاستجابة."""
     global loaded_data
     loaded_data = []
 
     for file_name in JSON_FILES:
-        if os.path.exists(file_name):
+        # بناء المسار الكامل للملف داخل مجلد loaded_data
+        file_path = os.path.join(DATA_DIR, file_name)
+
+        if os.path.exists(file_path):
             try:
-                with open(file_name, "r", encoding="utf-8") as f:
+                with open(file_path, "r", encoding="utf-8") as f:
                     content = json.load(f)
                     # دعم كل من المصفوفات (List) والكائنات (Dict)
                     if isinstance(content, list):
@@ -33,14 +42,14 @@ def load_all_json_files():
                             loaded_data.append({"file": file_name, "content": item})
                     else:
                         loaded_data.append({"file": file_name, "content": content})
-                print(f"تم تحميل الملف بنجاح: {file_name}")
+                print(f"✅ تم تحميل الملف بنجاح: {file_name}")
             except Exception as e:
-                print(f"خطأ أثناء قراءة الملف {file_name}: {e}")
+                print(f"❌ خطأ أثناء قراءة الملف {file_name}: {e}")
         else:
-            print(f"تحذير: الملف غير موجود -> {file_name}")
+            print(f"⚠️ الملف غير موجود في المسار -> {file_path}")
 
 
-# استدعاء دالة التحميل
+# استدعاء دالة التحميل فور تشغيل الخادم
 load_all_json_files()
 
 # ==========================================
@@ -112,6 +121,7 @@ async def health_check():
     return {
         "status": "ok",
         "loaded_records": len(loaded_data),
+        "data_directory": DATA_DIR,
         "message": "Server is active",
     }
 
@@ -131,7 +141,7 @@ async def search_stream(req: QueryRequest):
 
             return EventSourceResponse(greeting_generator())
 
-    # ثانياً: البحث المباشر في ملفات JSON وبث النتيجة
+    # ثانياً: البحث المباشر في ملفات JSON وبث النتيجة مباشرة
     async def json_generator():
         try:
             if not loaded_data:
