@@ -1,8 +1,6 @@
 fastapi
 uvicorn
-openai
 sse-starlette
 huggingface_hub
-langchain-community
-faiss-cpu
+numpy
 pydantic
