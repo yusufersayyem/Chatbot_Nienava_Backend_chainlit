@@ -16,17 +16,16 @@ app = FastAPI(title="RAG Streaming Backend - Nineveh Edu")
 # 1. إعداد المتغيرات والمفاتيح
 # ==========================================
 HF_TOKEN = os.environ.get("HF_TOKEN")
-OPENROUTER_API_KEY = os.environ.get("OPENROUTER_API_KEY")  # مفتاح OpenRouter
+OPENROUTER_API_KEY = os.environ.get("OPENROUTER_API_KEY")
 
 EMBEDDING_MODEL_ID = "BAAI/bge-m3"
 FAISS_INDEX_PATH = "faiss_index"
 
-# 🟢 التعديل 1: تهيئة عميل AsyncOpenAI ليتصل بـ OpenRouter بدلاً من Hugging Face
+# تهيئة عميل AsyncOpenAI للاتصال بـ OpenRouter
 openrouter_client = AsyncOpenAI(
     base_url="https://openrouter.ai/api/v1",
     api_key=OPENROUTER_API_KEY,
     default_headers={
-        # ترويسات اختيارية يفضل إضافتها وفق توثيق OpenRouter
         "HTTP-Referer": "https://nineveh-edu.gov.iq",
         "X-Title": "Nineveh Edu Chatbot",
     },
@@ -107,8 +106,15 @@ class QueryRequest(BaseModel):
 
 
 # ==========================================
-# 5. نقطة النهاية (Endpoint) للبث المباشر
+# 5. نقاط النهاية (Endpoints)
 # ==========================================
+
+# نقطة فحص الصحة لإبقاء السيرفر نَشِطاً عبر UptimeRobot
+@app.get("/health")
+async def health_check():
+    return {"status": "ok", "message": "Server is active"}
+
+
 @app.post("/search-stream")
 async def search_stream(req: QueryRequest):
     user_query = req.query.strip()
@@ -120,14 +126,14 @@ async def search_stream(req: QueryRequest):
             async def greeting_generator():
                 for word in response_text.split(" "):
                     yield {"data": word + " "}
-                    await asyncio.sleep(0.02)
+                    await asyncio.sleep(0.01)
 
             return EventSourceResponse(greeting_generator())
 
     # ثانياً: البحث في FAISS ثم استدعاء النموذج عبر مولد الـ SSE
     async def llm_generator():
         try:
-            # البحث في FAISS
+            # البحث في FAISS (البحث الموازي لتجنب تعطيل الـ Event Loop)
             context = "لا يوجد سياق متوفر."
             if vector_store:
                 try:
@@ -150,9 +156,9 @@ async def search_stream(req: QueryRequest):
 السياق المتاح:
 {context}"""
 
-            # 🟢 التعديل 2: استدعاء نموذج Ling 3.0 عبر OpenRouter
+            # استدعاء النموذج عبر OpenRouter بدون قدرات الـ Reasoning لتقليل الـ Latency
             response_stream = await openrouter_client.chat.completions.create(
-                model="inclusionai/ling-3.0-flash-fin:free",  # اسم الموديل على OpenRouter
+                model="inclusionai/ling-3.0-flash-fin:free",
                 messages=[
                     {"role": "system", "content": system_instruction},
                     {"role": "user", "content": user_query},
@@ -160,8 +166,6 @@ async def search_stream(req: QueryRequest):
                 temperature=0.2,
                 max_tokens=2048,
                 stream=True,
-                # 🟢 التعديل 3: إضافة خاصية الـ reasoning إن كنت تريد تفعيل قدرات التفكير الفائق في الموديل
-                extra_body={"reasoning": {"enabled": True}},
             )
 
             async for chunk in response_stream:
@@ -170,6 +174,6 @@ async def search_stream(req: QueryRequest):
                     yield {"data": content}
 
         except Exception as inner_e:
-                    yield {"data": f"\n⚠️ [حدث خطأ في معالجة الطلب: {str(inner_e)}]"}
+            yield {"data": f"\n⚠️ [حدث خطأ في معالجة الطلب: {str(inner_e)}]"}
 
     return EventSourceResponse(llm_generator())
