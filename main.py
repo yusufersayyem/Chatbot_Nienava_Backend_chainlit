@@ -1,6 +1,5 @@
 import asyncio
 from contextlib import asynccontextmanager
-import gc
 import json
 import os
 from typing import List
@@ -8,40 +7,49 @@ from typing import List
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 import numpy as np
+
+import requests
 from pydantic import BaseModel
-from sentence_transformers import SentenceTransformer
 from sse_starlette.sse import EventSourceResponse
 
+# ==========================================
+# 1. الإعدادات والتهيئات
+# ==========================================
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 DATA_DIR = os.path.join(BASE_DIR, "loaded_data")
 JSON_FILES = ["data1.json", "data2.json", "data3.json", "data4.json", "data5.json"]
 
-# استخدام النموذج الأكثر خفة وسرعة للغة العربية
-EMBEDDING_MODEL_NAME = (
-    "sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2"
-)
+# ضع مفتاح HuggingFace الخاص بك هنا أو عبر متغيرات البيئة في Render
+HF_API_TOKEN = os.getenv("HF_API_TOKEN", "ضع_مفتاح_HUGGINGFACE_هنا")
 
-model = None
+# نموذج التضمين على Hugging Face
+API_URL = "https://api-inference.huggingface.co/pipeline/feature-extraction/sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2"
+HEADERS = {"Authorization": f"Bearer {HF_API_TOKEN}"}
+
 loaded_chunks: List[str] = []
 chunk_embeddings: np.ndarray = None
 
 
-def load_model_safely():
-  """تحميل النموذج بتقليل استهلاك الذاكرة."""
-  global model
-  if model is None:
-    print("⏳ جاري تحميل نموذج التضمين...")
-    model = SentenceTransformer(EMBEDDING_MODEL_NAME)
-    # تقليل دقة النموذج لتوفير 50% من الذاكرة
-    model.to("cpu")
-    print("✅ تم تحميل النموذج.")
+def get_embeddings_from_hf(texts: List[str]) -> np.ndarray:
+  """إرسال النصوص إلى Hugging Face والحصول على المتجهات."""
+  response = requests.post(
+      API_URL,
+      headers=HEADERS,
+      json={"inputs": texts, "options": {"wait_for_model": True}},
+  )
+
+  if response.status_code != 200:
+    raise Exception(f"HF API Error: {response.status_code} - {response.text}")
+
+  embeddings = np.array(response.json())
+  # تطبيق Normalization للمتجهات
+  norms = np.linalg.norm(embeddings, axis=1, keepdims=True)
+  return embeddings / np.maximum(norms, 1e-12)
 
 
 async def prepare_and_embed_data():
-  """تحميل النصوص واستخراج المتجهات باستهلاك منخفض للذاكرة."""
+  """تحميل النصوص واستدعاء الـ API لتوليد المتجهات عند الإقلاع."""
   global loaded_chunks, chunk_embeddings
-
-  load_model_safely()
 
   raw_texts = []
   for file_name in JSON_FILES:
@@ -61,21 +69,22 @@ async def prepare_and_embed_data():
         print(f"❌ خطأ أثناء قراءة {file_name}: {e}")
 
   loaded_chunks = raw_texts
-  if loaded_chunks:
-    print(f"⏳ جاري توليد المتجهات لـ ({len(loaded_chunks)}) نص...")
-    # حساب المتجهات على دفعات صغيرة لتجنب الـ OOM
-    embeddings = await asyncio.to_thread(
-        model.encode,
-        loaded_chunks,
-        batch_size=16,
-        normalize_embeddings=True,
-        show_progress_bar=False,
-    )
-    chunk_embeddings = np.array(embeddings, dtype=np.float32)
-    print("✅ اكتمل استخراج المتجهات بنجاح.")
 
-  # تنظيف الذاكرة المؤقتة
-  gc.collect()
+  if loaded_chunks:
+    print(f"⏳ جاري جلب المتجهات لـ ({len(loaded_chunks)}) نص عبر API...")
+    try:
+      # تقسيم النصوص لدفعة بحجم 32 لتفادي حدود الطلب
+      batch_size = 32
+      all_embeddings = []
+      for i in range(0, len(loaded_chunks), batch_size):
+        batch = loaded_chunks[i : i + batch_size]
+        batch_emb = await asyncio.to_thread(get_embeddings_from_hf, batch)
+        all_embeddings.append(batch_emb)
+
+      chunk_embeddings = np.vstack(all_embeddings)
+      print("✅ تم جلب المتجهات بنجاح بدون استهلاك ذاكرة السيرفر!")
+    except Exception as e:
+      print(f"❌ خطأ أثناء جلب المتجهات: {e}")
 
 
 @asynccontextmanager
@@ -84,9 +93,8 @@ async def lifespan(app: FastAPI):
   yield
 
 
-app = FastAPI(title="Semantic Search API", lifespan=lifespan)
+app = FastAPI(title="HuggingFace API Search - Nineveh Edu", lifespan=lifespan)
 
-# تفعيل CORS للفرونت إند
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -101,10 +109,12 @@ class QueryRequest(BaseModel):
 
 
 def semantic_search(query: str, top_k: int = 3) -> List[str]:
-  if chunk_embeddings is None or len(loaded_chunks) == 0 or model is None:
+  if chunk_embeddings is None or len(loaded_chunks) == 0:
     return []
 
-  query_vec = model.encode([query], normalize_embeddings=True)[0]
+  # جلب متجه الاستعلام من API
+  query_vec = get_embeddings_from_hf([query])[0]
+
   similarities = np.dot(chunk_embeddings, query_vec)
   top_indices = np.argsort(similarities)[::-1][:top_k]
 
@@ -125,6 +135,7 @@ async def search_stream(req: QueryRequest):
       matched_results = await asyncio.to_thread(
           semantic_search, user_query, 3
       )
+
       if not matched_results:
         yield {
             "data": (
