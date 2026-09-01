@@ -4,3 +4,4 @@ sse-starlette
 huggingface_hub
 numpy
 pydantic
+sentence-transformers
