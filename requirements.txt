@@ -1,7 +1,8 @@
+--find-links https://download.pytorch.org/whl/torch_stable.html
+torch--cpu
 fastapi
 uvicorn
 sentence-transformers
 numpy
 pydantic
 sse-starlette
-torch
