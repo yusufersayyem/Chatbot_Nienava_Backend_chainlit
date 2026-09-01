@@ -1,7 +1,7 @@
 fastapi
 uvicorn
-sse-starlette
-huggingface_hub
+sentence-transformers
 numpy
 pydantic
-sentence-transformers
+sse-starlette
+torch
