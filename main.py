@@ -1,4 +1,5 @@
 import asyncio
+from contextlib import asynccontextmanager
 import json
 import os
 import re
@@ -10,19 +11,16 @@ import numpy as np
 from pydantic import BaseModel
 from sse_starlette.sse import EventSourceResponse
 
-app = FastAPI(title="HuggingFace BGE-M3 API Search - Nineveh Edu")
-
 # ==========================================
 # 1. الإعدادات والتهيئات
 # ==========================================
-HF_TOKEN = os.environ.get("HF_TOKEN")  # قم بإضافة مفتاح HuggingFace في متغيرات البيئة
+HF_TOKEN = os.environ.get("HF_TOKEN")
 EMBEDDING_MODEL_ID = "BAAI/bge-m3"
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 DATA_DIR = os.path.join(BASE_DIR, "loaded_data")
 JSON_FILES = ["data1.json", "data2.json", "data3.json", "data4.json", "data5.json"]
 
-# تهيئة العميل الخاص بـ Hugging Face
 hf_client = InferenceClient(model=EMBEDDING_MODEL_ID, token=HF_TOKEN)
 
 loaded_chunks: List[str] = []
@@ -36,15 +34,21 @@ def get_embedding_via_api(text: str) -> List[float]:
         if hasattr(response, "tolist"):
             response = response.tolist()
 
-        # معالجة استجابة الـ API وتخفيض التنعيم للأبعاد (Flattening)
-        while isinstance(response, list) and len(response) > 0 and isinstance(response[0], list):
+        while (
+            isinstance(response, list)
+            and len(response) > 0
+            and isinstance(response[0], list)
+        ):
             if isinstance(response[0][0], list):
                 response = response[0]
             else:
                 break
 
-        # حساب المتوسط إذا تم إرجاع متجهات لكل توكن (Token-level embeddings)
-        if isinstance(response, list) and len(response) > 0 and isinstance(response[0], list):
+        if (
+            isinstance(response, list)
+            and len(response) > 0
+            and isinstance(response[0], list)
+        ):
             response = [sum(col) / len(response) for col in zip(*response)]
 
         return response
@@ -53,8 +57,8 @@ def get_embedding_via_api(text: str) -> List[float]:
         return []
 
 
-def prepare_and_embed_data():
-    """تحميل النصوص وحساب المتجهات عبر API لمرة واحدة عند بدء تشغيل الخادم."""
+async def prepare_and_embed_data():
+    """تحميل النصوص وحساب المتجهات بشكل غير متزامني (Async) عند بدء التطبيق."""
     global loaded_chunks, chunk_embeddings
     loaded_chunks = []
     chunk_embeddings = []
@@ -69,7 +73,9 @@ def prepare_and_embed_data():
                     items = content if isinstance(content, list) else [content]
                     for item in items:
                         if isinstance(item, dict):
-                            formatted_str = "\n".join([f"{k}: {v}" for k, v in item.items()])
+                            formatted_str = "\n".join(
+                                [f"{k}: {v}" for k, v in item.items()]
+                            )
                         else:
                             formatted_str = str(item)
                         raw_texts.append(formatted_str)
@@ -79,22 +85,35 @@ def prepare_and_embed_data():
 
     loaded_chunks = raw_texts
     if loaded_chunks:
-        print(f"⏳ جاري استخراج Embeddings لـ ({len(loaded_chunks)}) نص عبر Hugging Face API...")
+        print(
+            f"⏳ جاري استخراج Embeddings لـ ({len(loaded_chunks)}) نص عبر Hugging Face API..."
+        )
         for i, text in enumerate(loaded_chunks):
-            emb = get_embedding_via_api(text)
+            # تشغيل الدالة الإجرائية داخل Thread لتجنب حظر السيرفر
+            emb = await asyncio.to_thread(get_embedding_via_api, text)
             if emb:
                 chunk_embeddings.append(emb)
             else:
-                # إضافة متجه أصفار مؤقت إذا فشل الطلب لتجنب الاختلال
                 chunk_embeddings.append([0.0] * 1024)
-            # تجنب تجاوز حدود الاستدعاءات (Rate Limits)
-            asyncio.run(asyncio.sleep(0.05))
+
+            # استخدام asyncio.sleep بشكل صحيح
+            await asyncio.sleep(0.05)
 
         print("✅ اكتمل استخراج المتجهات من API بنجاح.")
 
 
-# قراءة البيانات والتضمينات عند تشغيل الخادم
-prepare_and_embed_data()
+# إدارة دورة حياة التطبيق (Lifespan)
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    # يُنفذ عند بدء تشغيل الخادم
+    asyncio.create_task(prepare_and_embed_data())
+    yield
+    # يُنفذ عند إغلاق الخادم
+
+
+app = FastAPI(
+    title="HuggingFace BGE-M3 API Search - Nineveh Edu", lifespan=lifespan
+)
 
 # ==========================================
 # 2. خريطة التحيات المباشرة
@@ -123,27 +142,24 @@ def semantic_search(query: str, top_k: int = 5) -> List[str]:
     if not chunk_embeddings or len(loaded_chunks) == 0:
         return []
 
-    # 1. استدعاء API لحساب متجهات نص استعلام المستخدم
     query_vec = get_embedding_via_api(query)
     if not query_vec:
         return []
 
-    # 2. حساب نسبة التشابه جيب التمام (Cosine Similarity)
     query_np = np.array(query_vec)
     chunks_np = np.array(chunk_embeddings)
 
-    # التطبيع للحصول على نتائج أدق
     query_norm = query_np / (np.linalg.norm(query_np) + 1e-10)
-    chunks_norm = chunks_np / (np.linalg.norm(chunks_np, axis=1, keepdims=True) + 1e-10)
+    chunks_norm = chunks_np / (
+        np.linalg.norm(chunks_np, axis=1, keepdims=True) + 1e-10
+    )
 
     similarities = np.dot(chunks_norm, query_norm)
-
-    # 3. ترتيب وتصنيف النتائج
     top_indices = np.argsort(similarities)[::-1][:top_k]
 
     results = []
     for idx in top_indices:
-        if similarities[idx] > 0.30:  # عتبة قبول النتيجة
+        if similarities[idx] > 0.30:
             results.append(loaded_chunks[idx])
 
     return results
@@ -152,11 +168,13 @@ def semantic_search(query: str, top_k: int = 5) -> List[str]:
 # ==========================================
 # 4. نقاط النهاية (Endpoints)
 # ==========================================
+@app.get("/")
 @app.get("/health")
 async def health_check():
     return {
         "status": "ok",
         "loaded_records": len(loaded_chunks),
+        "processed_embeddings": len(chunk_embeddings),
         "embedding_model": EMBEDDING_MODEL_ID,
         "mode": "Hugging Face Inference API",
     }
@@ -166,7 +184,6 @@ async def health_check():
 async def search_stream(req: QueryRequest):
     user_query = req.query.strip()
 
-    # أولاً: الرد السريع المباشر للتحيات
     for pattern, response_text in GREETINGS_MAP.items():
         if re.search(pattern, user_query, re.IGNORECASE):
 
@@ -177,10 +194,11 @@ async def search_stream(req: QueryRequest):
 
             return EventSourceResponse(greeting_generator())
 
-    # ثانياً: البحث الدلالي وبث النتيجة
     async def json_generator():
         try:
-            matched_results = await asyncio.to_thread(semantic_search, user_query, 5)
+            matched_results = await asyncio.to_thread(
+                semantic_search, user_query, 5
+            )
 
             if not matched_results:
                 yield {
