@@ -16,13 +16,12 @@ BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 EMBEDDINGS_FILE = os.path.join(BASE_DIR, "embeddings.npy")
 CHUNKS_FILE = os.path.join(BASE_DIR, "chunks.json")
 
-# رابط الـ Inference API المباشر لـ Hugging Face
+# رابط الـ Router لـ Hugging Face
 API_URL = "https://router.huggingface.co/hf-inference/models/sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2"
 
-# قراءة HF_TOKEN من متغيرات بيئة Render
+# قراءة الـ Token من متغير البيئة
 HF_TOKEN = os.getenv("HF_TOKEN", "")
 
-# إعداد الرأسيات للتأكد من تمرير التوكين وتقليل احتمال 429
 HEADERS = {
     "Authorization": f"Bearer {HF_TOKEN}",
     "Content-Type": "application/json"
@@ -33,16 +32,24 @@ chunk_embeddings: np.ndarray = None
 
 
 def get_query_embedding_from_hf(text: str) -> np.ndarray:
-    """استخراج متجه النص عبر API مع معالجة حظر 429 وإعادة المحاولة التلقائية."""
+    """استخراج متجه النص عبر API مع الهيكلية المتوافقة الحديثة لتفادي خطأ 400."""
     max_retries = 5
-    retry_delay = 2.0  # التمهل الابتدائي بالثواني
+    retry_delay = 2.0
+
+    payload = {
+        "inputs": {
+            "source_sentence": text,
+            "sentences": [text]
+        },
+        "options": {"wait_for_model": True}
+    }
 
     for attempt in range(max_retries):
         try:
             response = requests.post(
                 API_URL,
                 headers=HEADERS,
-                json={"inputs": [text], "options": {"wait_for_model": True}},
+                json=payload,
                 timeout=25
             )
 
@@ -50,26 +57,29 @@ def get_query_embedding_from_hf(text: str) -> np.ndarray:
                 emb_data = response.json()
                 embeddings = np.array(emb_data, dtype=np.float32)
 
+                if embeddings.ndim == 3:
+                    embeddings = embeddings[0]
                 if embeddings.ndim == 1:
                     embeddings = np.expand_dims(embeddings, axis=0)
 
-                # L2 Normalization
                 norms = np.linalg.norm(embeddings, axis=1, keepdims=True)
                 return embeddings / np.maximum(norms, 1e-12)
 
-            # معالجة 429 (Rate Limit) و 503 (Model Loading) عبر الانتظار التصاعدي
             elif response.status_code in (429, 503):
                 print(f"⚠️ تنبيه من HF API ({response.status_code}). محاولة {attempt + 1}/{max_retries} - انتظار {retry_delay} ثوانٍ...")
                 time.sleep(retry_delay)
-                retry_delay *= 1.8  # Exponential Backoff
+                retry_delay *= 1.8
             else:
+                if response.status_code == 400 and attempt == 0:
+                    payload = {"inputs": [text], "options": {"wait_for_model": True}}
+                    continue
                 raise Exception(f"HF API Error ({response.status_code}): {response.text}")
 
         except requests.exceptions.RequestException as e:
             print(f"⚠️ خطأ اتصال: {e}. محاولة جديدة خلال ثانيتين...")
             time.sleep(2)
 
-    raise Exception("تجاوز الحد المسموح للطلبات (429). يرجى التأكد من ضبط HF_TOKEN أو الانتظار لحظات.")
+    raise Exception("فشل الاتصال بـ Hugging Face API. يرجى التأكد من ضبط HF_TOKEN بشكل صحيح.")
 
 
 def load_data():
@@ -95,7 +105,6 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(title="Nineveh Edu Search - HF API Backend", lifespan=lifespan)
 
-# إعدادات CORS للسماح بالاتصال من أي فرونت إند
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -113,10 +122,8 @@ def semantic_search(query: str, top_k: int = 3) -> List[str]:
     if chunk_embeddings is None or len(loaded_chunks) == 0:
         return []
 
-    # استخراج متجه النص عبر Hugging Face API
     query_vec = get_query_embedding_from_hf(query)[0]
 
-    # حساب تشابه ضرب المتجهات (Dot Product)
     similarities = np.dot(chunk_embeddings, query_vec)
     top_indices = np.argsort(similarities)[::-1][:top_k]
 
