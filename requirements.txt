@@ -1,9 +1,8 @@
 fastapi
 uvicorn
 numpy
+requests
 sse-starlette
 pydantic
 chainlit
 httpx
-transformers
-onnxruntime
