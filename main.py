@@ -10,10 +10,6 @@ import numpy as np
 from pydantic import BaseModel
 from sentence_transformers import SentenceTransformer
 from sse_starlette.sse import EventSourceResponse
-import torch
-
-# تقليل استهلاك الموارد المخصصة في البيئات المجانية
-torch.set_num_threads(1)
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 EMBEDDINGS_FILE = os.path.join(BASE_DIR, "embeddings.npy")
@@ -26,24 +22,27 @@ chunk_embeddings: np.ndarray = None
 
 def load_data():
     global model, loaded_chunks, chunk_embeddings
+    
     if not os.path.exists(EMBEDDINGS_FILE) or not os.path.exists(CHUNKS_FILE):
-        raise FileNotFoundError("❌ ملفات المتجهات غير موجودة! يرجى رفع ملفات embeddings.npy و chunks.json على Git.")
+        raise FileNotFoundError("❌ ملفات المتجهات غير موجودة!")
 
-    # تحميل المتجهات من الملف المرفوع على Git
+    print("⚡ جاري تحميل المتجهات من النواة المحلية...")
     chunk_embeddings = np.load(EMBEDDINGS_FILE)
+    
     with open(CHUNKS_FILE, "r", encoding="utf-8") as f:
         loaded_chunks = json.load(f)
 
-    # تحميل النموذج خفيف الوزن للـ CPU
-    model = SentenceTransformer(MODEL_NAME, device="cpu")
-    print("✅ تم تحميل الباك إند بنجاح على Render!")
+    print("⏳ جاري تحميل نموذج ONNX الخفيف تقليلاً للذاكرة...")
+    # استخدام backend="onnx" يمنع استهلاك الذاكرة العالي بفضل محرك ONNX
+    model = SentenceTransformer(MODEL_NAME, backend="onnx")
+    print("✅ تم تحميل الباك إند بنجاح وبأقل استهلاك ذاكرة ممكن!")
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     await asyncio.to_thread(load_data)
     yield
 
-app = FastAPI(title="Nineveh Edu Search - Render", lifespan=lifespan)
+app = FastAPI(title="Nineveh Edu Search - Low Memory", lifespan=lifespan)
 
 app.add_middleware(
     CORSMiddleware,
