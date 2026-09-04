@@ -16,8 +16,8 @@ BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 EMBEDDINGS_FILE = os.path.join(BASE_DIR, "embeddings.npy")
 CHUNKS_FILE = os.path.join(BASE_DIR, "chunks.json")
 
-# رابط الـ Router لـ Hugging Face
-API_URL = "https://router.huggingface.co/hf-inference/models/sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2"
+# رابط Feature Extraction لاستخراج متجهات بطول 384 مباشرة
+API_URL = "https://api-inference.huggingface.co/pipeline/feature-extraction/sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2"
 
 # قراءة الـ Token من متغير البيئة
 HF_TOKEN = os.getenv("HF_TOKEN", "")
@@ -32,15 +32,12 @@ chunk_embeddings: np.ndarray = None
 
 
 def get_query_embedding_from_hf(text: str) -> np.ndarray:
-    """استخراج متجه النص عبر API مع الهيكلية المتوافقة الحديثة لتفادي خطأ 400."""
+    """استخراج متجه النص Feature Vector بطول 384 مع معالجة الأبعاد تلقائياً."""
     max_retries = 5
     retry_delay = 2.0
 
     payload = {
-        "inputs": {
-            "source_sentence": text,
-            "sentences": [text]
-        },
+        "inputs": [text],
         "options": {"wait_for_model": True}
     }
 
@@ -57,11 +54,18 @@ def get_query_embedding_from_hf(text: str) -> np.ndarray:
                 emb_data = response.json()
                 embeddings = np.array(emb_data, dtype=np.float32)
 
+                # التعامل مع اختلاف أبعاد استجابة HF API وتحويلها لشكـل (1, 384)
                 if embeddings.ndim == 3:
-                    embeddings = embeddings[0]
-                if embeddings.ndim == 1:
+                    # في حال إرجاع (batch, seq_len, 384) نحسب Mean Pooling عبر أبعاد الكلمات
+                    embeddings = np.mean(embeddings, axis=1)
+                elif embeddings.ndim == 1:
                     embeddings = np.expand_dims(embeddings, axis=0)
 
+                # التأكد من طابق البعد الثاني ليكون 384 بالضبط قبل عملية الضرب
+                if embeddings.shape[1] != 384:
+                    raise ValueError(f"شكل المتجه الناتج غير مطابق: {embeddings.shape} والمتوقع هو (1, 384)")
+
+                # L2 Normalization
                 norms = np.linalg.norm(embeddings, axis=1, keepdims=True)
                 return embeddings / np.maximum(norms, 1e-12)
 
@@ -70,9 +74,6 @@ def get_query_embedding_from_hf(text: str) -> np.ndarray:
                 time.sleep(retry_delay)
                 retry_delay *= 1.8
             else:
-                if response.status_code == 400 and attempt == 0:
-                    payload = {"inputs": [text], "options": {"wait_for_model": True}}
-                    continue
                 raise Exception(f"HF API Error ({response.status_code}): {response.text}")
 
         except requests.exceptions.RequestException as e:
@@ -94,7 +95,7 @@ def load_data():
     with open(CHUNKS_FILE, "r", encoding="utf-8") as f:
         loaded_chunks = json.load(f)
 
-    print("✅ الباك إند جاهز ويعمل عبر الـ API بنجاح دون استهلاك ذاكرة RAM!")
+    print(f"✅ تم تحميل المتجهات بنجاح بأبعاد: {chunk_embeddings.shape}")
 
 
 @asynccontextmanager
@@ -122,8 +123,10 @@ def semantic_search(query: str, top_k: int = 3) -> List[str]:
     if chunk_embeddings is None or len(loaded_chunks) == 0:
         return []
 
+    # استخراج متجه البحث وضمان أنه مصفوفة بأبعاد (1, 384)
     query_vec = get_query_embedding_from_hf(query)[0]
 
+    # عملية الضرب النقطي بين (199, 384) و (384,) ينتج عنها (199,)
     similarities = np.dot(chunk_embeddings, query_vec)
     top_indices = np.argsort(similarities)[::-1][:top_k]
 
