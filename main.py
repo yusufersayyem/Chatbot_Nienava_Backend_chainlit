@@ -24,18 +24,23 @@ def load_data():
     global model, loaded_chunks, chunk_embeddings
     
     if not os.path.exists(EMBEDDINGS_FILE) or not os.path.exists(CHUNKS_FILE):
-        raise FileNotFoundError("❌ ملفات المتجهات غير موجودة!")
+        raise FileNotFoundError("❌ ملفات المتجهات غير موجودة! يرجى التأكد من رفعها.")
 
-    print("⚡ جاري تحميل المتجهات من النواة المحلية...")
+    print("⚡ جاري تحميل المتجهات المحسوبة مسبقاً...")
     chunk_embeddings = np.load(EMBEDDINGS_FILE)
     
     with open(CHUNKS_FILE, "r", encoding="utf-8") as f:
         loaded_chunks = json.load(f)
 
-    print("⏳ جاري تحميل نموذج ONNX الخفيف تقليلاً للذاكرة...")
-    # استخدام backend="onnx" يمنع استهلاك الذاكرة العالي بفضل محرك ONNX
-    model = SentenceTransformer(MODEL_NAME, backend="onnx")
-    print("✅ تم تحميل الباك إند بنجاح وبأقل استهلاك ذاكرة ممكن!")
+    print("⏳ جاري تحميل نموذج ONNX المكمّم الخفيف تقليلاً للذاكرة...")
+    
+    # تحميل نسخة INT8 المخصصة لمعالجات x86/CPU بتقليل ذاكرة يتجاوز 60%
+    model = SentenceTransformer(
+        MODEL_NAME, 
+        backend="onnx",
+        model_kwargs={"file_name": "onnx/model_quint8_avx2.onnx"}
+    )
+    print("✅ تم تحميل النموذج بنجاح وبأقل استهلاك ذاكرة ممكن!")
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
