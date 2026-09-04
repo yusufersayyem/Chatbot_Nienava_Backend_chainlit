@@ -1,6 +1,9 @@
 fastapi
 uvicorn
-requests
+httpx
+sentence-transformers
+torch
 numpy
-pydantic
 sse-starlette
+chainlit
+pydantic
