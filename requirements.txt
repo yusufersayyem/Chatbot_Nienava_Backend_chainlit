@@ -5,5 +5,5 @@ sse-starlette
 pydantic
 chainlit
 httpx
-optimum[onnxruntime]
-sentence-transformers
+transformers
+onnxruntime
