@@ -1,8 +1,6 @@
 fastapi
 uvicorn
-numpy
-sse-starlette
-pydantic
-chainlit
-httpx
 cohere
+numpy
+pydantic
+sse-starlette
