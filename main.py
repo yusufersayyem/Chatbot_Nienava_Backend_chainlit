@@ -2,100 +2,66 @@ import asyncio
 from contextlib import asynccontextmanager
 import json
 import os
-import time
 from typing import List
 
+import cohere
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 import numpy as np
 from pydantic import BaseModel
-import requests
 from sse_starlette.sse import EventSourceResponse
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 EMBEDDINGS_FILE = os.path.join(BASE_DIR, "embeddings.npy")
 CHUNKS_FILE = os.path.join(BASE_DIR, "chunks.json")
 
-# رابط Feature Extraction لاستخراج متجهات بطول 384 مباشرة
-API_URL = "https://api-inference.huggingface.co/pipeline/feature-extraction/sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2"
+# قراءة API Key الخاص بـ Cohere من متغيرات البيئة
+COHERE_API_KEY = os.getenv("COHERE_API_KEY", "")
 
-# قراءة الـ Token من متغير البيئة
-HF_TOKEN = os.getenv("HF_TOKEN", "")
-
-HEADERS = {
-    "Authorization": f"Bearer {HF_TOKEN}",
-    "Content-Type": "application/json"
-} if HF_TOKEN else {"Content-Type": "application/json"}
+# تهيئة عميل Cohere
+co_client = cohere.Client(COHERE_API_KEY) if COHERE_API_KEY else None
 
 loaded_chunks: List[str] = []
 chunk_embeddings: np.ndarray = None
 
 
-def get_query_embedding_from_hf(text: str) -> np.ndarray:
-    """استخراج متجه النص Feature Vector بطول 384 مع معالجة الأبعاد تلقائياً."""
-    max_retries = 5
-    retry_delay = 2.0
+def get_query_embedding_from_cohere(text: str) -> np.ndarray:
+    """استخراج متجه النص باستخدام نموذج Cohere متعدد اللغات v3.0."""
+    if not co_client:
+        raise Exception("❌ لم يتم العثور على COHERE_API_KEY في متغيرات البيئة!")
 
-    payload = {
-        "inputs": [text],
-        "options": {"wait_for_model": True}
-    }
+    try:
+        # استخدام input_type="search_query" المخصص للاستعلامات في Cohere
+        response = co_client.embed(
+            texts=[text],
+            model="embed-multilingual-v3.0",
+            input_type="search_query"
+        )
 
-    for attempt in range(max_retries):
-        try:
-            response = requests.post(
-                API_URL,
-                headers=HEADERS,
-                json=payload,
-                timeout=25
-            )
+        embeddings = np.array(response.embeddings, dtype=np.float32)
 
-            if response.status_code == 200:
-                emb_data = response.json()
-                embeddings = np.array(emb_data, dtype=np.float32)
+        # حساب L2 Normalization لتسهيل عملية المقارنة
+        norms = np.linalg.norm(embeddings, axis=1, keepdims=True)
+        return embeddings / np.maximum(norms, 1e-12)
 
-                # التعامل مع اختلاف أبعاد استجابة HF API وتحويلها لشكـل (1, 384)
-                if embeddings.ndim == 3:
-                    # في حال إرجاع (batch, seq_len, 384) نحسب Mean Pooling عبر أبعاد الكلمات
-                    embeddings = np.mean(embeddings, axis=1)
-                elif embeddings.ndim == 1:
-                    embeddings = np.expand_dims(embeddings, axis=0)
-
-                # التأكد من طابق البعد الثاني ليكون 384 بالضبط قبل عملية الضرب
-                if embeddings.shape[1] != 384:
-                    raise ValueError(f"شكل المتجه الناتج غير مطابق: {embeddings.shape} والمتوقع هو (1, 384)")
-
-                # L2 Normalization
-                norms = np.linalg.norm(embeddings, axis=1, keepdims=True)
-                return embeddings / np.maximum(norms, 1e-12)
-
-            elif response.status_code in (429, 503):
-                print(f"⚠️ تنبيه من HF API ({response.status_code}). محاولة {attempt + 1}/{max_retries} - انتظار {retry_delay} ثوانٍ...")
-                time.sleep(retry_delay)
-                retry_delay *= 1.8
-            else:
-                raise Exception(f"HF API Error ({response.status_code}): {response.text}")
-
-        except requests.exceptions.RequestException as e:
-            print(f"⚠️ خطأ اتصال: {e}. محاولة جديدة خلال ثانيتين...")
-            time.sleep(2)
-
-    raise Exception("فشل الاتصال بـ Hugging Face API. يرجى التأكد من ضبط HF_TOKEN بشكل صحيح.")
+    except Exception as e:
+        print(f"❌ خطأ أئناء الاتصال بـ Cohere API: {str(e)}")
+        raise Exception(f"فشل الحصول على متجهات البحث من Cohere: {str(e)}")
 
 
 def load_data():
     global loaded_chunks, chunk_embeddings
 
     if not os.path.exists(EMBEDDINGS_FILE) or not os.path.exists(CHUNKS_FILE):
-        raise FileNotFoundError("❌ ملفات المتجهات غير موجودة! يرجى رفع embeddings.npy و chunks.json.")
+        raise FileNotFoundError("❌ ملفات المتجهات غير موجودة! يرجى التأكد من رفع embeddings.npy و chunks.json.")
 
-    print("⚡ جاري تحميل المتجهات والنصوص الجاهزة...")
+    print("⚡ جاري تحميل ملفات المتجهات والنصوص...")
     chunk_embeddings = np.load(EMBEDDINGS_FILE)
 
     with open(CHUNKS_FILE, "r", encoding="utf-8") as f:
         loaded_chunks = json.load(f)
 
-    print(f"✅ تم تحميل المتجهات بنجاح بأبعاد: {chunk_embeddings.shape}")
+    print(f"✅ تم تحميل البيانات بنجاح بأبعاد: {chunk_embeddings.shape}")
 
 
 @asynccontextmanager
@@ -104,7 +70,7 @@ async def lifespan(app: FastAPI):
     yield
 
 
-app = FastAPI(title="Nineveh Edu Search - HF API Backend", lifespan=lifespan)
+app = FastAPI(title="Nineveh Edu Search - Cohere API Backend", lifespan=lifespan)
 
 app.add_middleware(
     CORSMiddleware,
@@ -123,16 +89,23 @@ def semantic_search(query: str, top_k: int = 3) -> List[str]:
     if chunk_embeddings is None or len(loaded_chunks) == 0:
         return []
 
-    # استخراج متجه البحث وضمان أنه مصفوفة بأبعاد (1, 384)
-    query_vec = get_query_embedding_from_hf(query)[0]
+    # 1. استخراج متجه البحث من Cohere
+    query_vec = get_query_embedding_from_cohere(query)[0]
 
-    # عملية الضرب النقطي بين (199, 384) و (384,) ينتج عنها (199,)
+    # 2. التأكد من توافق أبعاد المتجهات
+    if chunk_embeddings.shape[1] != query_vec.shape[0]:
+        raise ValueError(
+            f"⚠️ عدم تطابق الأبعاد! أبعاد الملف الحالي هي {chunk_embeddings.shape[1]} بينما متجه Cohere هو {query_vec.shape[0]}. "
+            "يرجى إعادة توليد ملف embeddings.npy باستخدام Cohere."
+        )
+
+    # 3. حساب التشابه بالضرب النقطي (Dot Product)
     similarities = np.dot(chunk_embeddings, query_vec)
     top_indices = np.argsort(similarities)[::-1][:top_k]
 
     results = []
     for idx in top_indices:
-        if similarities[idx] > 0.10:
+        if similarities[idx] > 0.15:  # عتبة التشابه
             results.append(loaded_chunks[idx])
 
     return results
