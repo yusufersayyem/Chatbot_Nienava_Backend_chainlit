@@ -1,6 +1,3 @@
---extra-index-url https://download.pytorch.org/whl/cpu
-torch
-sentence-transformers
 fastapi
 uvicorn
 numpy
@@ -8,3 +5,5 @@ sse-starlette
 pydantic
 chainlit
 httpx
+optimum[onnxruntime]
+sentence-transformers
