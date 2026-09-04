@@ -2,105 +2,90 @@ import asyncio
 from contextlib import asynccontextmanager
 import json
 import os
+import time
 from typing import List
 
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 import numpy as np
 from pydantic import BaseModel
+import requests
 from sse_starlette.sse import EventSourceResponse
-
-# استيراد محرك ONNX والمحلل اللغوي فقط دون PyTorch
-import onnxruntime as ort
-from transformers import AutoTokenizer
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 EMBEDDINGS_FILE = os.path.join(BASE_DIR, "embeddings.npy")
 CHUNKS_FILE = os.path.join(BASE_DIR, "chunks.json")
-MODEL_NAME = "sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2"
 
-tokenizer = None
-ort_session = None
+# رابط الـ Router الخفيف والحديث من Hugging Face
+API_URL = "https://router.huggingface.co/hf-inference/models/sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2"
+
+# الحصول على الرمز من متغيرات البيئة تلقائياً
+HF_TOKEN = os.getenv("HF_TOKEN", "")
+
+HEADERS = {
+    "Authorization": f"Bearer {HF_TOKEN}",
+    "Content-Type": "application/json"
+} if HF_TOKEN else {"Content-Type": "application/json"}
+
 loaded_chunks: List[str] = []
 chunk_embeddings: np.ndarray = None
 
-def mean_pooling(model_output, attention_mask):
-    """دالة حساب المتوسط الموزون للمتجهات عبر NumPy."""
-    token_embeddings = model_output[0] # First element of model_output contains all token embeddings
-    input_mask_expanded = np.expand_dims(attention_mask, -1)
-    input_mask_expanded = np.broadcast_to(input_mask_expanded, token_embeddings.shape)
-    
-    sum_embeddings = np.sum(token_embeddings * input_mask_expanded, axis=1)
-    sum_mask = np.clip(input_mask_expanded.sum(axis=1), a_min=1e-9, a_max=None)
-    return sum_embeddings / sum_mask
+def get_query_embedding_from_hf(text: str) -> np.ndarray:
+    """استخراج متجه النص من API الخارجي بدون استهلاك ذاكرة محلياً."""
+    max_retries = 3
+    retry_delay = 3
 
-def encode_query_onnx(text: str) -> np.ndarray:
-    """استخراج متجه النص باستخدام ONNX بحد أدنى للذاكرة."""
-    # 1. التقطيع اللغوي (Tokenization)
-    encoded_input = tokenizer(
-        [text], 
-        padding=True, 
-        truncation=True, 
-        max_length=128, 
-        return_tensors="np"
-    )
-    
-    # 2. التمرير في محرك ONNX الخفيف
-    onnx_inputs = {
-        "input_ids": encoded_input["input_ids"].astype(np.int64),
-        "attention_mask": encoded_input["attention_mask"].astype(np.int64)
-    }
-    
-    # تحسين التوافقية لو كانت هناك المدخلات الإضافية (token_type_ids)
-    if "token_type_ids" in [inp.name for inp in ort_session.get_inputs()]:
-        onnx_inputs["token_type_ids"] = encoded_input.get(
-            "token_type_ids", 
-            np.zeros_like(encoded_input["input_ids"])
-        ).astype(np.int64)
+    for attempt in range(max_retries):
+        try:
+            response = requests.post(
+                API_URL,
+                headers=HEADERS,
+                json={"inputs": [text], "options": {"wait_for_model": True}},
+                timeout=15
+            )
 
-    onnx_outputs = ort_session.run(None, onnx_inputs)
-    
-    # 3. حساب Pooled Embeddings و L2 Normalization
-    sentence_embeddings = mean_pooling(onnx_outputs, encoded_input["attention_mask"])
-    norm = np.linalg.norm(sentence_embeddings, axis=1, keepdims=True)
-    return sentence_embeddings / np.maximum(norm, 1e-12)
+            if response.status_code == 200:
+                emb_data = response.json()
+                embeddings = np.array(emb_data, dtype=np.float32)
+
+                if embeddings.ndim == 1:
+                    embeddings = np.expand_dims(embeddings, axis=0)
+
+                # تطبيق L2 Normalization
+                norms = np.linalg.norm(embeddings, axis=1, keepdims=True)
+                return embeddings / np.maximum(norms, 1e-12)
+
+            elif response.status_code in (429, 503):
+                time.sleep(retry_delay)
+                retry_delay *= 1.5
+            else:
+                raise Exception(f"HF API Error ({response.status_code}): {response.text}")
+
+        except requests.exceptions.RequestException as e:
+            time.sleep(2)
+
+    raise Exception("فشل الاتصال بـ Hugging Face API بعد عدة محاولات.")
 
 def load_data():
-    global tokenizer, ort_session, loaded_chunks, chunk_embeddings
-    
-    if not os.path.exists(EMBEDDINGS_FILE) or not os.path.exists(CHUNKS_FILE):
-        raise FileNotFoundError("❌ ملفات المتجهات غير موجودة! يرجى رفعها في المستودع.")
+    global loaded_chunks, chunk_embeddings
 
-    print("⚡ جاري تحميل ملفات المتجهات المحسوبة...")
+    if not os.path.exists(EMBEDDINGS_FILE) or not os.path.exists(CHUNKS_FILE):
+        raise FileNotFoundError("❌ ملفات المتجهات غائبة! يرجى رفع embeddings.npy و chunks.json على Git.")
+
+    print("⚡ تحميل المتجهات والنصوص الجاهزة من الملفات المحلية...")
     chunk_embeddings = np.load(EMBEDDINGS_FILE)
-    
+
     with open(CHUNKS_FILE, "r", encoding="utf-8") as f:
         loaded_chunks = json.load(f)
 
-    print("⏳ جاري تحميل المحلل اللغوي ومحرك ONNX الصغير جداً...")
-    tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME)
-    
-    # استخدام ملف ONNX المكمّم صراحة عبر onnxruntime المباشر
-    from huggingface_hub import hf_hub_download
-    model_path = hf_hub_download(
-        repo_id=MODEL_NAME, 
-        filename="onnx/model_quint8_avx2.onnx"
-    )
-    
-    # إنشاء جلسة تشغيل خفيفة جداً بدون خيوط معالجة زائدة
-    opts = ort.SessionOptions()
-    opts.intra_op_num_threads = 1
-    opts.inter_op_num_threads = 1
-    ort_session = ort.InferenceSession(model_path, opts)
-    
-    print("✅ تم تحميل الباك إند بنجاح باستهلاك ذاكرة ضئيل جداً (< 150MB)!")
+    print("✅ الباك إند جاهز ويعمل عبر الـ API باستهلاك ذاكرة أقل من 80MB!")
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     await asyncio.to_thread(load_data)
     yield
 
-app = FastAPI(title="Ultra Low Memory Search", lifespan=lifespan)
+app = FastAPI(title="HF API Search - Zero Memory", lifespan=lifespan)
 
 app.add_middleware(
     CORSMiddleware,
@@ -114,10 +99,13 @@ class QueryRequest(BaseModel):
     query: str
 
 def semantic_search(query: str, top_k: int = 3) -> List[str]:
-    if ort_session is None or chunk_embeddings is None:
+    if chunk_embeddings is None or len(loaded_chunks) == 0:
         return []
 
-    query_vec = encode_query_onnx(query)[0]
+    # طلب متجه السؤال من الـ API الخارجي بدلاً من النموذج المحلي
+    query_vec = get_query_embedding_from_hf(query)[0]
+
+    # حساب ضرب التشابه (Dot Product) عبر NumPy
     similarities = np.dot(chunk_embeddings, query_vec)
     top_indices = np.argsort(similarities)[::-1][:top_k]
 
@@ -142,7 +130,7 @@ async def search_stream(req: QueryRequest):
 
             extracted_text = "\n\n---\n\n".join(matched_results)
             words = extracted_text.split(" ")
-            
+
             for i in range(0, len(words), 2):
                 chunk = " ".join(words[i : i + 2]) + " "
                 yield {"data": chunk}
