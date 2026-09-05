@@ -8,9 +8,10 @@ from typing import Any, Dict, List
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
+from rapidfuzz import fuzz, process
 from sse_starlette.sse import EventSourceResponse
 
-# تحديد مجلد العمل ومسار ملف JSON
+# تحديد مسار الملفات
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 DATA_FILE = os.path.join(BASE_DIR, "output_data.json")
 
@@ -18,32 +19,27 @@ loaded_data: List[Dict[str, Any]] = []
 
 
 def clean_text(text: str) -> str:
-    """تنظيف النص لتسهيل المطابقة (إزالة التشكيل والهمزات)"""
+    """تنظيف النص وتوحيد الأحرف العربية"""
     if not text:
         return ""
-    text = text.lower()
-    # إزالة التشكيل العربي
-    text = re.sub(r"[\u064B-\u0652]", "", text)
-    # توحيد الهمزات والأحرف
-    text = re.sub(r"[أإآ]", "ا", text)
-    text = re.sub(r"ة", "ه", text)
-    text = re.sub(r"ى", "ي", text)
+    text = str(text).lower()
+    text = re.sub(r"[\u064B-\u0652]", "", text)  # إزالة التشكيل
+    text = re.sub(r"[أإآ]", "ا", text)  # توحيد الهمزات
+    text = re.sub(r"ة", "ه", text)  # توحيد التاء المربوطة
+    text = re.sub(r"ى", "ي", text)  # توحيد الألف المقصورة
     return text.strip()
 
 
 def load_data():
-    """تحميل ملف output_data.json في الذاكرة عند بدء التشغيل"""
+    """تحميل ملف output_data.json عند التشغيل"""
     global loaded_data
 
     if not os.path.exists(DATA_FILE):
-        raise FileNotFoundError(
-            f"❌ لم يتم العثور على الملف: {DATA_FILE}. يرجى التأكد من وجود output_data.json في المجلد."
-        )
+        raise FileNotFoundError(f"❌ لم يتم العثور على الملف: {DATA_FILE}")
 
-    print("⚡ جاري تحميل بيانات output_data.json ...")
+    print("⚡ جاري تحميل ملف الأسئلة والأجوبة...")
     with open(DATA_FILE, "r", encoding="utf-8") as f:
         content = json.load(f)
-        # التعامل مع الملف سواء كان مصفوفة مباشرة أو كائن يحتوي على حقل "data"
         if isinstance(content, list):
             loaded_data = content
         elif isinstance(content, dict) and "data" in content:
@@ -51,7 +47,7 @@ def load_data():
         else:
             loaded_data = []
 
-    print(f"✅ تم تحميل البيانات بنجاح: {len(loaded_data)} عنصر/سؤال.")
+    print(f"✅ تم تحميل {len(loaded_data)} سؤال وجواب بنجاح.")
 
 
 @asynccontextmanager
@@ -60,9 +56,10 @@ async def lifespan(app: FastAPI):
     yield
 
 
-app = FastAPI(title="Nineveh Edu Search - Local Search", lifespan=lifespan)
+app = FastAPI(
+    title="Nineveh Edu Search - Rapid Fuzzy Search", lifespan=lifespan
+)
 
-# إعداد CORS للاتصال من أي واجهة
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -76,74 +73,55 @@ class QueryRequest(BaseModel):
     query: str
 
 
-def keyword_search(query: str, top_k: int = 1) -> List[Dict[str, Any]]:
-    """دالة البحث النصي المرنة مع حساب النقاط وتخفيض العتبة"""
+def smart_fuzzy_search(query: str) -> Dict[str, Any]:
+    """محرك البحث الذكي بالمطابقة الضبابية والكلمات المفتاحية"""
     if not loaded_data or not query.strip():
-        return []
+        return None
 
     cleaned_query = clean_text(query)
-    query_words = [w for w in cleaned_query.split() if len(w) > 1]
 
-    # أداء تصفية الكلمات الزائدة/الأدوات
-    stopwords = {
-        "عن",
-        "في",
-        "على",
-        "من",
-        "إلى",
-        "ما",
-        "هي",
-        "هو",
-        "كم",
-        "كيف",
-        "هل",
-        "متى",
-        "منهو",
-        "شنو",
-        "ماهي",
-        "ماهو",
-    }
-    filtered_words = [w for w in query_words if w not in stopwords]
-
-    # إذا كانت كل الكلمات أدوات، نستخدم الكلمات الأصلية
-    search_words = filtered_words if filtered_words else query_words
-
-    results = []
+    best_match = None
+    highest_score = 0.0
 
     for item in loaded_data:
-        score = 0
-        question_clean = clean_text(item.get("question", ""))
-        answer_clean = clean_text(item.get("answer", ""))
+        question_text = clean_text(item.get("question", ""))
+        answer_text = clean_text(item.get("answer", ""))
 
+        # جلب الكلمات المفتاحية وتحويلها لنص موحد
         raw_keywords = item.get("keywords", [])
-        keywords_clean = [
-            clean_text(str(k)) for k in raw_keywords if isinstance(k, (str, int))
-        ]
+        keywords_str = " ".join([clean_text(str(k)) for k in raw_keywords])
 
-        # 1. مطابقة عبارة البحث بالكامل داخل السؤال
-        if cleaned_query in question_clean:
-            score += 10
+        # 1. حساب نسبة تشابه السؤال المطروح مع السؤال المخزن (Partial & Token Ratio)
+        q_ratio = fuzz.token_set_ratio(cleaned_query, question_text)
 
-        # 2. مطابقة الكلمات المنفردة
-        for word in search_words:
-            if word in question_clean:
-                score += 3  # تطابق في نص السؤال
-            if any(word in kw for kw in keywords_clean):
-                score += 2  # تطابق في الكلمات المفتاحية
-            if word in answer_clean:
-                score += 1  # تطابق في نص الإجابة
+        # 2. حساب نسبة التشابه مع الكلمات المفتاحية
+        kw_ratio = fuzz.partial_ratio(cleaned_query, keywords_str)
 
-        if score > 0:
-            results.append({"score": score, "item": item})
+        # 3. حساب نسبة التشابه مع نص الإجابة نفسها
+        ans_ratio = fuzz.partial_ratio(cleaned_query, answer_text)
 
-    # ترتيب النتائج من الأكبر نقاطاً للأقل
-    results.sort(key=lambda x: x["score"], reverse=True)
+        # معادلة وزن النقاط الإجمالية
+        total_score = (q_ratio * 0.6) + (kw_ratio * 0.3) + (ans_ratio * 0.1)
 
-    # إرجاع أعلى نتيجة إذا حققت شرط الاستجابة (حتى لو كانت نقطة واحدة)
-    if results and results[0]["score"] >= 1:
-        return [results[0]["item"]]
+        # إذا تطابقت كلمة مفتاحية رئيسية بالكامل يُمنح بونص إضافي
+        for word in cleaned_query.split():
+            if len(word) > 2 and word in keywords_str:
+                total_score += 15
 
-    return []
+        if total_score > highest_score:
+            highest_score = total_score
+            best_match = item
+
+    # طباعة أعلى نسبة تشابه للـ Debug في سيرفر Render
+    print(
+        f"🔍 أفضل مطابقة للاستعلام [{query}]: النسبة = {highest_score:.2f}%"
+    )
+
+    # قبول الإجابة إذا تجاوزت نسبة التشابه 35%
+    if best_match and highest_score >= 35.0:
+        return best_match
+
+    return None
 
 
 @app.get("/")
@@ -157,24 +135,23 @@ async def search_stream(req: QueryRequest):
 
     async def json_generator():
         try:
-            matched_results = await asyncio.to_thread(
-                keyword_search, user_query, 1
+            matched_item = await asyncio.to_thread(
+                smart_fuzzy_search, user_query
             )
 
-            if not matched_results:
+            if not matched_item:
                 yield {
-                    "data": "عذراً، لم أجد أي معلومات مطابقة لاستفسارك في دليل التعليمات المتاح."
+                    "data": "عذراً، لم أجد إجابة مطابقة لاستفسارك في دليل التعليمات المتاح. يرجى كتابة كلمات مفتاحية أوردها الدليل."
                 }
                 return
 
-            best_match = matched_results[0]
-            answer_text = best_match.get("answer", "")
+            answer_text = matched_item.get("answer", "")
 
             if not answer_text:
-                yield {"data": "لم يتم العثور على نص الإجابة لهذا السؤال."}
+                yield {"data": "لم يتم العثور على نص الإجابة لطلبك."}
                 return
 
-            # بث النص كلمة كلمة لتجربة تفاعلية (Streaming)
+            # إرسال الإجابة بأسلوب Streaming تفاعلي
             words = answer_text.split(" ")
             for i in range(0, len(words), 2):
                 chunk = " ".join(words[i : i + 2]) + " "
