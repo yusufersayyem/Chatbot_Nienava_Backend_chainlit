@@ -1,52 +1,62 @@
 import json
+import chainlit as cl
 from rapidfuzz import fuzz, process
 
-# 1. تحميل ملف الاسئلة والأجوبة
-with open("questions_answers.json", "r", encoding="utf-8") as f:
-    qa_data = json.load(f)
+# ================= =================
+# 1. تحميل قاعدة بيانات الأسئلة والأجوبة
+# ===================================
+DATA_FILE = "questions_answers.json"
 
-# استخراج الأسئلة فقط
-questions_list = [item["question"] for item in qa_data]
+try:
+    with open(DATA_FILE, "r", encoding="utf-8") as f:
+        qa_data = json.load(f)
+    # استخراج قائمة الأسئلة فقط لتسريع عملية المقارنة والبحث
+    questions_list = [item["question"] for item in qa_data]
+    print(f"✅ تم تحميل {len(qa_data)} سؤال وجواب بنجاح.")
+except Exception as e:
+    print(f"❌ خطأ في تحميل ملف JSON: {e}")
+    qa_data = []
+    questions_list = []
 
 
-def get_answer(user_query, threshold=55):
-    """دالة البحث عن الإجابة الأكثر ملاءمة"""
-    if not user_query.strip():
-        return "يرجى كتابة سؤال!"
+# ===================================
+# 2. أحداث الباكند الخاصة بـ Chainlit
+# ===================================
 
-    # عملية البحث واختيار أفضل النتايج
+
+@cl.on_chat_start
+async def start():
+    """تنفذ هذه الدالة فور فتح المستخدم لواجهة الشات"""
+    await cl.Message(
+        content="أهلاً بك! أنا البوت التفاعلي لتربية نينوى. تفضل بطرح سؤالك وسأجيبك فوراً."
+    ).send()
+
+
+@cl.on_message
+async def main(message: cl.Message):
+    """تنفذ هذه الدالة في كل مرة يرسل فيها المستخدم رسالة"""
+    user_query = message.content.strip()
+
+    # التحقق من وجود بيانات
+    if not qa_data:
+        await cl.Message(
+            content="عذراً، قاعدة البيانات غير متوفرة حالياً."
+        ).send()
+        return
+
+    # منطق البحث والتحليل (Matching Engine)
+    # يبحث عن أفضل تطابق بين سؤال المستخدم وقائمة الأسئلة
     match, score, index = process.extractOne(
         user_query, questions_list, scorer=fuzz.token_set_ratio
     )
 
-    if score >= threshold:
-        return {
-            "question": match,
-            "answer": qa_data[index]["answer"],
-            "score": round(score, 2),
-        }
+    # تحديد نسبة القبول (مثلاً 55% أو أعلى)
+    if score >= 55:
+        # جلب الجواب الخاص بالسؤال المطابق
+        bot_response = qa_data[index]["answer"]
     else:
-        return {
-            "question": None,
-            "answer": "عذراً، لم أجد إجابة دقيقة لسؤالك في قاعدة البيانات.",
-            "score": round(score, 2),
-        }
+        # رسالة تعذر العثور على إجابة
+        bot_response = "عذراً، لم أجد إجابة دقيقة لسؤالك في قاعدة البيانات. يرجى التأكد من صياغة السؤال."
 
-
-# 2. تجربة حية ومستمرة للمحادثة
-print("🤖 أهلاً بك في بوت الاستفسارات! (اكتب 'خروج' للإغلاق)\n")
-
-while True:
-    user_input = input("👤 سؤالك: ")
-    if user_input.strip().lower() in ["خروج", "exit", "quit"]:
-        print("وداعاً!")
-        break
-
-    res = get_answer(user_input)
-
-    if res.get("question"):
-        print(f"🎯 السؤال المطابق: {res['question']}")
-        print(f"💡 الجواب: {res['answer']}")
-        print(f"📊 دقة التطابق: {res['score']}%\n")
-    else:
-        print(f"❌ {res['answer']}\n")
+    # إرسال النتيجة إلى واجهة المستخدم
+    await cl.Message(content=bot_response).send()
