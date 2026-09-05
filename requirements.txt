@@ -1,6 +1,4 @@
-fastapi
-uvicorn
-cohere
-numpy
-pydantic
-sse-starlette
+fastapi>=0.100.0
+uvicorn[standard]>=0.22.0
+pydantic>=2.0.0
+sse-starlette>=1.6.0
