@@ -1,2 +1,4 @@
-chainlit
+fastapi
+uvicorn
 rapidfuzz
+pydantic
