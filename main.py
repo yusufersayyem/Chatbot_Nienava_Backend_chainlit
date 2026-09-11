@@ -1,86 +1,97 @@
-import asyncio
+import os
 import json
-from fastapi import FastAPI
-from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import StreamingResponse
+import random
+import cohere
+import numpy as np
+from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
-from rapidfuzz import fuzz, process
 
-app = FastAPI(
-    title="Nineveh Education Chatbot Backend",
-    description="Backend service matching questions and streaming responses.",
-)
+app = FastAPI(title="Cohere Intent Classifier API")
 
-# 1. السماح باتصالات CORS لتجنب مشاكل الاتصال مع الفرونت إند
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
+# 1. تهيئة عميل Cohere
+COHERE_API_KEY = os.environ.get("COHERE_API_KEY")
+co = cohere.Client(COHERE_API_KEY)
 
-# 2. تحميل ملف الأسئلة والأجوبة
-DATA_FILE = "questions_answers.json"
+# متغيرات التخزين
+patterns_list = []
+intents_mapping = []
+patterns_embeddings = None
 
-try:
-    with open(DATA_FILE, "r", encoding="utf-8") as f:
-        qa_data = json.load(f)
-    questions_list = [item["question"] for item in qa_data]
-    print(f"✅ تم تحميل {len(qa_data)} سؤال بنجاح.")
-except Exception as e:
-    print(f"❌ خطأ في تحميل ملف JSON: {e}")
-    qa_data = []
-    questions_list = []
-
-
-# 3. تحديد كائن البيانات القادم من الفرونت إند
-class QueryModel(BaseModel):
-    query: str
-
-
-# 4. دالة توليد البث المباشر (SSE Stream Generator)
-async def generate_response_stream(user_query: str):
-    if not qa_data:
-        err_msg = json.dumps(
-            {"data": "عذراً، قاعدة البيانات غير متوفرة حالياً."}
-        )
-        yield f"data: {err_msg}\n\n"
-        yield "data: [DONE]\n\n"
+def load_and_embed_intents(json_path="intents.json"):
+    global patterns_list, intents_mapping, patterns_embeddings
+    
+    if not os.path.exists(json_path):
+        print(f"تنبيه: لم يتم العثور على الملف {json_path}")
         return
 
-    # المطابقة باستخدام RapidFuzz
-    match, score, index = process.extractOne(
-        user_query, questions_list, scorer=fuzz.token_set_ratio
+    with open(json_path, "r", encoding="utf-8") as f:
+        data = json.load(f)
+        
+    for intent in data["intents"]:
+        tag = intent["tag"]
+        responses = intent["responses"]
+        for pattern in intent["patterns"]:
+            patterns_list.append(pattern)
+            intents_mapping.append({
+                "tag": tag,
+                "responses": responses
+            })
+            
+    print("جاري استدعاء Cohere API لحساب متجهات الـ patterns...")
+    
+    response = co.embed(
+        texts=patterns_list,
+        model="embed-multilingual-v3.0",
+        input_type="search_document"
     )
+    
+    embeddings_matrix = np.array(response.embeddings)
+    patterns_embeddings = embeddings_matrix / np.linalg.norm(embeddings_matrix, axis=1, keepdims=True)
+    print("تم تجهيز متجهات الـ patterns بنجاح!")
 
-    if score >= 55:
-        response_text = qa_data[index]["answer"]
+# تحميل البيانات عند تشغيل الخادم
+@app.on_event("startup")
+async def startup_event():
+    load_and_embed_intents()
+
+# نموذج طلب البيانات للمستخدم
+class QueryRequest(BaseModel):
+    text: str
+
+@app.post("/predict")
+async def predict_intent(request: QueryRequest):
+    if patterns_embeddings is None:
+        raise HTTPException(status_code=500, detail="نموذج المتجهات غير جاهز بعد.")
+
+    user_text = request.text
+    
+    # تحويل نص المستخدم إلى متجه
+    user_response = co.embed(
+        texts=[user_text],
+        model="embed-multilingual-v3.0",
+        input_type="search_query"
+    )
+    
+    user_embedding = np.array(user_response.embeddings[0])
+    user_embedding = user_embedding / np.linalg.norm(user_embedding)
+    
+    # حساب التشابه الدلالي
+    similarities = np.dot(patterns_embeddings, user_embedding)
+    best_match_idx = np.argmax(similarities)
+    best_score = float(similarities[best_match_idx])
+    
+    THRESHOLD = 0.40
+    
+    if best_score >= THRESHOLD:
+        matched_intent = intents_mapping[best_match_idx]
+        selected_response = random.choice(matched_intent["responses"])
+        tag = matched_intent["tag"]
     else:
-        response_text = (
-            "عذراً، لم أجد إجابة دقيقة لسؤالك. يرجى التأكد من صياغة السؤال."
-        )
-
-    # محاكاة البث المباشر (إرسال النص كلمة بكلمة ليعطي مظهراً تفاعلياً ممتازاً)
-    words = response_text.split(" ")
-    for word in words:
-        payload = json.dumps({"data": word + " "}, ensure_ascii=False)
-        yield f"data: {payload}\n\n"
-        await asyncio.sleep(0.04)  # تأخير زمني بسيط بين الكلمات
-
-    # إشارة انتهاء البث المقروءة في الفرونت إند
-    yield "data: [DONE]\n\n"
-
-
-# 5. المسار المطابق تماماً لما يطلبه الفرونت إند
-@app.post("/search-stream")
-async def search_stream(payload: QueryModel):
-    return StreamingResponse(
-        generate_response_stream(payload.query), media_type="text/event-stream"
-    )
-
-
-# نقطة فحص الصحة للسيرفر على Render
-@app.get("/")
-def health_check():
-    return {"status": "Backend is up and running!"}
+        selected_response = "عذراً، لم أفهم قصدك بوضوح. هل يمكنك إعادة الصياغة؟"
+        tag = "unknown"
+        
+    return {
+        "response": selected_response,
+        "score": best_score,
+        "tag": tag
+    }
