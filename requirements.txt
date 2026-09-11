@@ -1,5 +1,4 @@
 fastapi
-uvicorn 
-cohere 
+uvicorn
+cohere
 numpy
-pydantic
